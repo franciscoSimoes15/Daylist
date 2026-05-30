@@ -156,7 +156,7 @@ function App() {
   const fetchUserFriends = async () => {
     if (!activeUser) return;
     try {
-      const res = await fetch(`http://localhost:8000/user/${activeUser.id}/friends`);
+      const res = await fetch(`http://localhost:8000/friends/${activeUser.id}/list`);
       const data = await res.json();
       setUserFriends(Array.isArray(data) ? data : []);
     } catch (err) {

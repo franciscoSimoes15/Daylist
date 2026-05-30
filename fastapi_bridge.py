@@ -609,6 +609,11 @@ def friend_history(user_id: int, n: int = 20):
     songs = get_friend_history(user_id, n)
     return [SongInfoWithScore(**s) for s in songs]
 
+# --- Friend list ---
+@app.get("/friends/{user_id}/list", response_model=List[UserProfile])
+def list_friends(user_id: int):
+    return get_user_friends(user_id)
+
 # --- Notifications ---
 @app.get("/notifications/{user_id}", response_model=List[NotificationItem])
 def notifications(user_id: int):

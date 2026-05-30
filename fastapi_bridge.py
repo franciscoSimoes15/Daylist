@@ -1,4 +1,5 @@
 import threading
+import random
 import asyncio
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -44,15 +45,16 @@ def kafka_worker(loop, servers, topic):
             bootstrap_servers=servers,
             value_deserializer=lambda v: json.loads(v.decode('utf-8')),
             api_version=(0, 10, 1),
-            auto_offset_reset='latest'
+            auto_offset_reset='latest'   # ← era 'earliest', volta para 'latest'
         )
         for message in consumer:
             data = message.value
             logger.info(f"Kafka Worker Received: {data}")
             asyncio.run_coroutine_threadsafe(
-                manager.broadcast({"type": "kafka_event", "data": data}),
+                manager.broadcast({"type": "kafka_event", "data": data}),  # ← tipo correto
                 loop
             )
+            logger.info(f"Kafka Worker Received: {data}")
     except Exception as e:
         logger.error(f"Kafka Worker FAILED: {e}")
 
@@ -570,6 +572,65 @@ def get_artist_songs(artist_id: int, n: int = 10) -> List[dict]:
         logger.error(f"Artist songs fetch failed: {e}")
         return []
 
+def get_user_queue(user_id: int) -> List[dict]:
+    queue_key = f"queue:{user_id}"
+    if r_cache:
+        items = r_cache.lrange(queue_key, 0, -1)
+        if items:
+            return [json.loads(i) for i in items]
+    return []
+
+def set_user_queue(user_id: int, songs: List[dict]):
+    queue_key = f"queue:{user_id}"
+    if not r_cache:
+        return
+    pipe = r_cache.pipeline()
+    pipe.delete(queue_key)
+    for song in songs[:10]:
+        pipe.rpush(queue_key, json.dumps(song))
+    pipe.expire(queue_key, 3600)  # expira em 1h
+    pipe.execute()
+
+def pop_next_from_queue(user_id: int) -> Optional[dict]:
+    queue_key = f"queue:{user_id}"
+    if r_cache:
+        item = r_cache.lpop(queue_key)
+        if item:
+            return json.loads(item)
+    return None
+
+def get_user_history_home(user_id: int, n: int = 8) -> List[dict]:
+    """Histórico recente do user para a Home — Redis primeiro, Hive como fallback."""
+    cache_key = f"home:{user_id}"
+    if r_cache:
+        cached = r_cache.get(cache_key)
+        if cached:
+            return json.loads(cached)
+
+    if not HIVE_AVAILABLE:
+        return []
+
+    try:
+        conn = hive_conn()
+        cursor = conn.cursor()
+        cursor.execute(f"""
+            SELECT r.id, r.name, a.name
+            FROM curated_history h
+            JOIN curated_recording r ON h.recording_id = r.id
+            {ARTIST_JOIN}
+            WHERE h.user_id = {user_id}
+            GROUP BY r.id, r.name, a.name
+            ORDER BY count(*) DESC
+            LIMIT {n}
+        """)
+        songs = [{"id": int(r[0]), "name": str(r[1]), "artist": str(r[2])}
+                 for r in cursor.fetchall()]
+        if r_cache and songs:
+            r_cache.setex(cache_key, 600, json.dumps(songs))
+        return songs
+    except Exception as e:
+        logger.error(f"Home history fetch failed: {e}")
+        return []
 # ============================================================
 # ROUTES
 # ============================================================
@@ -639,6 +700,29 @@ def search_fallback(q: str, n: int = 20):
     logger.warning(f"Fallback search triggered for: {q}")
     return search(q, n)
 
+@app.get("/queue/{user_id}")
+def get_queue(user_id: int):
+    return get_user_queue(user_id)
+
+@app.post("/queue/{user_id}")
+def set_queue(user_id: int, songs: List[SongInfo]):
+    set_user_queue(user_id, [s.dict() for s in songs])
+    return {"status": "ok", "queued": len(songs)}
+
+@app.get("/queue/{user_id}/next")
+def next_in_queue(user_id: int):
+    song = pop_next_from_queue(user_id)
+    if not song:
+        raise HTTPException(status_code=404, detail="Queue empty")
+    return song
+
+@app.get("/home/{user_id}")
+def home_feed(user_id: int, n: int = 8):
+    songs = get_user_history_home(user_id, n)
+    # Quando um user toca uma música, a cache home é invalidada
+    # e na próxima visita mostra o histórico atualizado
+    return {"source": "redis_history" if r_cache else "hive", "songs": songs}
+
 # --- Events → Kafka ---
 @app.post("/event/play")
 def record_play(event: PlayEvent):
@@ -649,6 +733,9 @@ def record_play(event: PlayEvent):
         "duration_ms": event.duration_ms,
         "source": "frontend"
     })
+    # Invalida cache home para forçar refresh na próxima visita
+    if r_cache:
+        r_cache.delete(f"home:{event.user_id}")
     return {"status": "event_recorded", "topic": KAFKA_TOPIC_PLAY}
 
 @app.post("/event/skip")
@@ -671,6 +758,65 @@ def record_like(event: LikeEvent):
         "source": "frontend"
     })
     return {"status": "event_recorded", "topic": KAFKA_TOPIC_LIKE}
+
+@app.post("/broadcast/play-random")
+async def broadcast_random_song():
+    if not HIVE_AVAILABLE:
+        raise HTTPException(status_code=503, detail="Hive not available")
+    
+    try:
+        pool_key = "broadcast:song_pool"
+        pool = None
+
+        if r_cache:
+            cached = r_cache.get(pool_key)
+            if cached:
+                pool = json.loads(cached)
+
+        if not pool:
+            conn = hive_conn()
+            cursor = conn.cursor()
+            cursor.execute(f"""
+                SELECT r.id, r.name, a.name
+                FROM curated_recording r
+                {ARTIST_JOIN}
+                LIMIT 500
+            """)
+            pool = [{"id": int(r[0]), "name": str(r[1]), "artist": str(r[2])}
+                    for r in cursor.fetchall()]
+            if r_cache and pool:
+                r_cache.setex(pool_key, 3600, json.dumps(pool))
+
+        users = get_hive_users()
+
+        # Música diferente para cada user
+        assignments = {user.id: random.choice(pool) for user in users}
+
+        for user in users:
+            song = assignments[user.id]
+            send_kafka_event(KAFKA_TOPIC_PLAY, {
+                "user_id": user.id,
+                "recording_id": song["id"],
+                "ts": time.time(),
+                "duration_ms": 30000,
+                "source": "broadcast"
+            })
+
+        
+        await manager.broadcast({
+            "type": "broadcast_play",
+            "assignments": {str(k): v for k, v in assignments.items()}
+        })
+
+        return {"status": "broadcasting", "assignments": assignments, "users_notified": len(users)}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Broadcast failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+        
 
 # --- WebSocket ---
 @app.websocket("/ws")

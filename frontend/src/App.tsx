@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { useNavigate, useLocation } from 'react-router-dom';
 import { 
   Home, 
@@ -78,6 +78,14 @@ function App() {
   const [timeOfDay, setTimeOfDay] = useState<string>("morning");
   const [isFetching, setIsFetching] = useState<boolean>(false);
 
+  const [queue, setQueue] = useState<Song[]>([]);
+  const [queueIndex, setQueueIndex] = useState<number>(0);
+
+  const activeUserRef = useRef<UserProfile | null>(null);
+  useEffect(() => {
+    activeUserRef.current = activeUser;
+  }, [activeUser]);
+
   const handleTabChange = (newTab: string) => {
     navigate(`/${newTab === 'home' ? '' : newTab}`);
   };
@@ -93,27 +101,44 @@ function App() {
 
   // WebSocket for notifications
   useEffect(() => {
-    const ws = new WebSocket("ws://localhost:8000/ws");
-    ws.onmessage = (event) => {
-      try {
-        const payload = JSON.parse(event.data);
-        if (payload.type === "kafka_event") {
-          const { user_id, recording_id } = payload.data;
+  const ws = new WebSocket("ws://localhost:8000/ws");
+  ws.onmessage = (event) => {
+    try {
+      const payload = JSON.parse(event.data);
+      if (payload.type === "kafka_event") {
+        const { user_id, recording_id } = payload.data;
+        const newNotif = {
+          id: Date.now(),
+          message: `Kafka: User ${user_id} played Song ${recording_id}`
+        };
+        setNotifications(prev => [newNotif, ...prev].slice(0, 5));
+        setTimeout(() => {
+          setNotifications(prev => prev.filter(n => n.id !== newNotif.id));
+        }, 5000);
+      } else if (payload.type === "broadcast_play") {
+        // FIX: usa o ref para ter sempre o valor atual
+        const currentUserId = String(activeUserRef.current?.id);
+        const song = payload.assignments?.[currentUserId];
+        if (song) {
+          setCurrentSong(song);
+          setIsPlaying(true);
+          setCurrentTime(0);
           const newNotif = {
             id: Date.now(),
-            message: `Kafka: User ${user_id} played Song ${recording_id}`
+            message: `🎵 Broadcast: "${song.name}" — ${song.artist}`
           };
           setNotifications(prev => [newNotif, ...prev].slice(0, 5));
           setTimeout(() => {
             setNotifications(prev => prev.filter(n => n.id !== newNotif.id));
-          }, 5000);
+          }, 6000);
         }
-      } catch (err) {
-        console.error("WebSocket message error:", err);
       }
-    };
-    return () => ws.close();
-  }, []);
+    } catch (err) {
+      console.error("WebSocket message error:", err);
+    }
+  };
+  return () => ws.close();
+}, []); // continua sem dependências — o ref resolve o stale closure
 
   // Slider effect
   useEffect(() => {
@@ -122,7 +147,7 @@ function App() {
       interval = setInterval(() => {
         setCurrentTime((prev) => {
           if (prev >= duration) {
-            setIsPlaying(false);
+            playNext();
             return 0;
           }
           return prev + 1;
@@ -132,7 +157,7 @@ function App() {
       clearInterval(interval);
     }
     return () => clearInterval(interval);
-  }, [isPlaying, currentSong, duration]);
+  }, [isPlaying, currentSong, duration, queueIndex, queue]);
 
   // Fetch initial users
   useEffect(() => {
@@ -181,7 +206,7 @@ function App() {
     setIsPlaying(false);
 
     await Promise.all([
-      fetchRecommendations(),
+      fetchHome(),
       fetchPlaylist(timeOfDay),
       fetchFriends(),
       fetchNotifications(),
@@ -298,20 +323,64 @@ function App() {
   };
 
   // Fetch recommendations
-  const fetchRecommendations = async () => {
+  const fetchHome = async () => {
+  if (!activeUser) return;
+  setLoading(true);
+  try {
+    const res = await fetch(`http://localhost:8000/home/${activeUser.id}?n=8`);
+    const data = await res.json();
+    setSongs(data.songs || []);
+    setSource(data.source || "unknown");
+  } catch (err) {
+    setMessage("Error fetching home feed.");
+    setSongs([]);
+  }
+  setLoading(false);
+};
+const playQueue = async (songList: Song[], startIndex: number = 0) => {
+  if (!activeUser) return;
+  const remaining = songList.slice(startIndex + 1, startIndex + 11);
+  
+  // Guarda as próximas 10 no Redis
+  await fetch(`http://localhost:8000/queue/${activeUser.id}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(remaining)
+  });
+
+  setQueue(songList);
+  setQueueIndex(startIndex);
+  playSong(songList[startIndex]);
+};
+
+const playingNextRef = useRef(false);
+// Quando a música termina, busca a próxima do Redis
+const playNext = async () => {
+  if (playingNextRef.current) return;
+
+  playingNextRef.current = true;
+
+  try {
     if (!activeUser) return;
-    setLoading(true);
-    try {
-      const res = await fetch(`http://localhost:8000/recommend/${activeUser.id}?n=8`);
-      const data = await res.json();
-      setSongs(data.songs || []);
-      setSource(data.source || "unknown");
-    } catch (err) {
-      setMessage("Error fetching from Big Data API.");
-      setSongs([]);
+
+    const res = await fetch(
+      `http://localhost:8000/queue/${activeUser.id}/next`
+    );
+
+    if (res.ok) {
+      const song = await res.json();
+
+      setQueueIndex(prev => prev + 1);
+      playSong(song);
+    } else {
+      setIsPlaying(false);
+      setQueue([]);
+      setQueueIndex(0);
     }
-    setLoading(false);
-  };
+  } finally {
+    playingNextRef.current = false;
+  }
+};
 
   const playSong = async (song: Song) => {
     if (!activeUser) return;
@@ -329,7 +398,7 @@ function App() {
       // WAIT 2 SECONDS for Kafka -> Spark -> Redis processing
       // THEN refresh recommendations to see live update!
       setTimeout(() => {
-        fetchRecommendations();
+        fetchHome();
         setMessage(`Recommendations updated by Live Spark Stream!`);
         setTimeout(() => setMessage(""), 3000);
       }, 2500);
@@ -474,7 +543,14 @@ function App() {
                </div>
             )}
           </div>
-
+          
+          <button
+            onClick={() => fetch("http://localhost:8000/broadcast/play-random", { method: "POST" })}
+            className="flex items-center space-x-2 bg-green-600 hover:bg-green-500 px-3 py-1.5 rounded-full text-xs font-bold transition"
+          >
+            <Disc3 className="h-3.5 w-3.5" />
+            <span>Broadcast</span>
+          </button>
           <div className="flex items-center space-x-4 relative">
              {/* Profile Dropdown Toggle */}
              <button 
@@ -602,7 +678,7 @@ function App() {
                       <div 
                         key={index} 
                         className="bg-[#181818] p-4 rounded hover:bg-[#282828] transition duration-300 group cursor-pointer relative"
-                        onClick={() => playSong(song)}
+                        onClick={() => playQueue(songs, index)}
                       >
                         <div className="w-full aspect-square bg-gray-800 rounded mb-4 shadow-2xl flex items-center justify-center relative overflow-hidden">
                           <Music className="h-16 w-16 text-gray-500" />
@@ -652,7 +728,7 @@ function App() {
                         <div 
                           key={index} 
                           className="bg-[#181818] p-4 rounded hover:bg-[#282828] transition duration-300 group cursor-pointer relative"
-                          onClick={() => playSong(song)}
+                          onClick={() => playQueue(searchResults, index)}
                         >
                           <div className="w-full aspect-square bg-gray-800 rounded mb-4 shadow-2xl flex items-center justify-center relative overflow-hidden">
                             <Music className="h-16 w-16 text-gray-500" />
@@ -744,7 +820,7 @@ function App() {
                   </h3>
                   <div className="space-y-4 max-h-[400px] overflow-y-auto pr-2 custom-scrollbar">
                     {friendHistory.length > 0 ? friendHistory.map((song, i) => (
-                      <div key={i} className="flex items-center justify-between group p-3 hover:bg-white/10 rounded-xl bg-white/5 border border-white/5 transition cursor-pointer" onClick={() => playSong(song)}>
+                      <div key={i} className="flex items-center justify-between group p-3 hover:bg-white/10 rounded-xl bg-white/5 border border-white/5 transition cursor-pointer" onClick={() => playQueue(friendHistory, i)}>
                         <div className="flex items-center min-w-0">
                           <div className="w-10 h-10 bg-gray-800 rounded flex items-center justify-center mr-4 shrink-0">
                             <Music className="h-4 w-4 text-gray-500" />
@@ -828,7 +904,12 @@ function App() {
                             <div 
                               key={song.id} 
                               className="flex items-center justify-between p-2 hover:bg-white/5 rounded transition group cursor-pointer"
-                              onClick={() => playSong(song)}
+                              onClick={() =>
+                                playQueue(
+                                  artistSongs,
+                                  artistSongs.findIndex(s => s.id === song.id)
+                                )
+                              }
                             >
                               <div className="flex items-center space-x-3 min-w-0 flex-1">
                                 <div className="w-6 h-6 bg-gray-800 rounded flex items-center justify-center group-hover:bg-green-500 transition shrink-0">
@@ -862,7 +943,12 @@ function App() {
                   <div className="bg-green-600/20 p-6 rounded-2xl border border-green-500/20">
                     <h3 className="font-bold text-xl mb-2 flex items-center capitalize"><Disc3 className="mr-2 h-5 w-5" /> {timeOfDay} Mix</h3>
                     <p className="text-xs text-gray-400 mb-4">Curated by Big Data engine for your {timeOfDay} listening habits.</p>
-                    <button className="w-full bg-green-500 text-black font-bold py-2 rounded-full hover:scale-105 transition shadow-lg">PLAY MIX</button>
+                   <button
+                      className="w-full bg-green-500 text-black font-bold py-2 rounded-full hover:scale-105 transition shadow-lg"
+                      onClick={() => playlist.length > 0 && playQueue(playlist, 0)}
+                    >
+                      PLAY MIX
+                    </button>
                   </div>
                   
                   <div className="bg-white/5 p-4 rounded-xl border border-white/5">
@@ -889,7 +975,11 @@ function App() {
                       </thead>
                       <tbody className="divide-y divide-white/5">
                         {playlist.length > 0 ? playlist.map((song, i) => (
-                          <tr key={song.id} className="hover:bg-white/5 group transition cursor-pointer" onClick={() => playSong(song)}>
+                          <tr
+                            key={song.id}
+                            className="hover:bg-white/5 group transition cursor-pointer"
+                            onClick={() => playQueue(playlist, i)}
+                          >
                             <td className="px-6 py-4 text-gray-500 text-xs">{i + 1}</td>
                             <td className="px-6 py-4 min-w-0">
                               <div className="flex items-center min-w-0">
@@ -961,9 +1051,9 @@ function App() {
             >
                {isPlaying ? <Pause className="h-4 w-4 fill-black" /> : <Play className="h-4 w-4 fill-black ml-0.5" />}
             </button>
-            <SkipForward 
-              className={`h-5 w-5 transition ${currentSong ? 'text-white cursor-pointer hover:scale-110' : 'text-gray-600 cursor-not-allowed'}`} 
-              onClick={() => currentSong && skipSong()}
+            <SkipForward
+              className={`h-5 w-5 transition ${currentSong ? 'text-white cursor-pointer hover:scale-110' : 'text-gray-600 cursor-not-allowed'}`}
+              onClick={() => currentSong && playNext()}
             />
           </div>
           <div className="w-full flex items-center space-x-2">

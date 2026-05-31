@@ -29,6 +29,8 @@ interface Song {
   name: string;
   artist: string;
   score?: number;
+  position?: number;
+  number?: string;
 }
 
 interface UserProfile {
@@ -51,6 +53,12 @@ interface UserNotification {
   notified_at: string;
 }
 
+interface AlbumTracks {
+  release_id: number;
+  release_name: string;
+  tracks: Song[];
+}
+
 function App() {
   const navigate = useNavigate();
   const location = useLocation();
@@ -71,6 +79,7 @@ function App() {
   const [message, setMessage] = useState<string>("");
   const [currentSong, setCurrentSong] = useState<Song | null>(null);
   const [isPlaying, setIsPlaying] = useState<boolean>(false);
+  const [likedSongKeys, setLikedSongKeys] = useState<Set<string>>(new Set());
   const [searchQuery, setSearchQuery] = useState<string>("");
   const [isUserMenuOpen, setIsUserMenuOpen] = useState<boolean>(false);
   const [currentTime, setCurrentTime] = useState<number>(0);
@@ -81,10 +90,16 @@ function App() {
 
   const [queue, setQueue] = useState<Song[]>([]);
   const [queueIndex, setQueueIndex] = useState<number>(0);
+  const [selectedAlbum, setSelectedAlbum] = useState<AlbumTracks | null>(null);
+  const [albumLoading, setAlbumLoading] = useState<boolean>(false);
+  const [selectedProfile, setSelectedProfile] = useState<UserProfile | null>(null);
+  const [profileTopTracks, setProfileTopTracks] = useState<Song[]>([]);
+  const [profileLoading, setProfileLoading] = useState<boolean>(false);
 
   const [isNotifMenuOpen, setIsNotifMenuOpen] = useState<boolean>(false);
   const [notifSeen, setNotifSeen] = useState<boolean>(false);
 
+  const usersFetchedRef = useRef(false);
   const activeUserRef = useRef<UserProfile | null>(null);
   useEffect(() => {
     activeUserRef.current = activeUser;
@@ -101,6 +116,20 @@ function App() {
     const mins = Math.floor(seconds / 60);
     const secs = Math.floor(seconds % 60);
     return `${mins}:${secs.toString().padStart(2, "0")}`;
+  };
+
+  const songKey = (song: Song) => `${song.id}:${song.name}:${song.artist}`;
+  const isCurrentSong = (song: Song) => currentSong ? songKey(currentSong) === songKey(song) : false;
+
+  const fetchWithTimeout = async (url: string, options: RequestInit = {}, timeoutMs = 60000) => {
+    const controller = new AbortController();
+    const timeoutId = window.setTimeout(() => controller.abort(), timeoutMs);
+
+    try {
+      return await fetch(url, { cache: "no-store", ...options, signal: controller.signal });
+    } finally {
+      window.clearTimeout(timeoutId);
+    }
   };
 
   const notifCounterRef = useRef(0);
@@ -166,9 +195,11 @@ function App() {
     if (isPlaying && currentSong) {
       interval = setInterval(() => {
         setCurrentTime((prev) => {
-          if (prev >= duration) {
-            playNext();
-            return 0;
+          if (prev + 1 >= duration) {
+            window.setTimeout(() => {
+              playNext();
+            }, 0);
+            return duration;
           }
           return prev + 1;
         });
@@ -181,10 +212,13 @@ function App() {
 
   // Fetch initial users
   useEffect(() => {
+    if (usersFetchedRef.current) return;
+    usersFetchedRef.current = true;
+
     const fetchUsers = async () => {
       setLoading(true);
       try {
-        const res = await fetch("http://localhost:8000/users");
+        const res = await fetch("http://localhost:8000/users", { cache: "no-store" });
         const data = await res.json();
         const userList = Array.isArray(data) ? data : [];
         setUsers(userList);
@@ -192,8 +226,9 @@ function App() {
       } catch (err) {
         console.error("Failed to fetch users", err);
         setUsers([]);
+      } finally {
+        setLoading(false);
       }
-      setLoading(false);
     };
     fetchUsers();
   }, []);
@@ -201,7 +236,7 @@ function App() {
   const fetchUserFriends = async () => {
     if (!activeUser) return;
     try {
-      const res = await fetch(`http://localhost:8000/friends/${activeUser.id}/list`);
+      const res = await fetchWithTimeout(`http://localhost:8000/friends/${activeUser.id}/list`);
       const data = await res.json();
       setUserFriends(Array.isArray(data) ? data : []);
     } catch (err) {
@@ -222,17 +257,23 @@ function App() {
     setUserFriends([]);
     setArtistSongs([]);
     setSelectedArtist(null);
+    setSelectedAlbum(null);
+    setSelectedProfile(null);
+    setProfileTopTracks([]);
     setCurrentSong(null);
     setIsPlaying(false);
 
-    await Promise.all([
-      fetchHome(),
-      fetchPlaylist(timeOfDay),
-      fetchFriends(),
-      fetchNotifications(),
-      fetchUserFriends()
-    ]);
-    setIsFetching(false);
+    try {
+      await Promise.allSettled([
+        fetchHome(),
+        fetchPlaylist(timeOfDay),
+        fetchFriends(),
+        fetchNotifications(),
+        fetchUserFriends()
+      ]);
+    } finally {
+      setIsFetching(false);
+    }
   };
 
   // Fetch everything when user changes
@@ -246,8 +287,11 @@ function App() {
       const loadPlaylist = async () => {
         setIsFetching(true);
         setPlaylist([]); // Clear old playlist before fetching new one
-        await fetchPlaylist(timeOfDay);
-        setIsFetching(false);
+        try {
+          await fetchPlaylist(timeOfDay);
+        } finally {
+          setIsFetching(false);
+        }
       };
       loadPlaylist();
     }
@@ -275,7 +319,7 @@ function App() {
 
   const fetchSearch = async (query: string) => {
     try {
-      const res = await fetch(`http://localhost:8000/search?q=${encodeURIComponent(query)}`);
+      const res = await fetchWithTimeout(`http://localhost:8000/search?q=${encodeURIComponent(query)}`);
       if (!res.ok) {
         console.error("Search API returned error:", res.status);
         return;
@@ -292,7 +336,7 @@ function App() {
   const fetchPlaylist = async (tod: string) => {
     if (!activeUser) return;
     try {
-      const res = await fetch(`http://localhost:8000/playlist/${activeUser.id}?time_of_day=${tod}`);
+      const res = await fetchWithTimeout(`http://localhost:8000/playlist/${activeUser.id}?time_of_day=${tod}`);
       const data = await res.json();
       setPlaylist(data.songs || []);
     } catch (err) {
@@ -304,7 +348,7 @@ function App() {
   const fetchFriends = async () => {
     if (!activeUser) return;
     try {
-      const res = await fetch(`http://localhost:8000/friends/${activeUser.id}/history`);
+      const res = await fetchWithTimeout(`http://localhost:8000/friends/${activeUser.id}/history`);
       const data = await res.json();
       setFriendHistory(Array.isArray(data) ? data : []);
     } catch (err) {
@@ -316,7 +360,7 @@ function App() {
   const fetchNotifications = async () => {
     if (!activeUser) return;
     try {
-      const res = await fetch(`http://localhost:8000/notifications/${activeUser.id}`);
+      const res = await fetchWithTimeout(`http://localhost:8000/notifications/${activeUser.id}`);
       if (!res.ok) {
         console.error("Notifications API returned error:", res.status);
         return;
@@ -334,7 +378,7 @@ function App() {
     setSelectedArtist(artistName);
     setArtistSongs([]);
     try {
-      const res = await fetch(`http://localhost:8000/artist/${artistId}/songs`);
+      const res = await fetchWithTimeout(`http://localhost:8000/artist/${artistId}/songs`);
       if (!res.ok) return;
       const data = await res.json();
       setArtistSongs(data);
@@ -343,40 +387,68 @@ function App() {
     }
   };
 
+  const fetchAlbumTracks = async (recordingId: number) => {
+    setAlbumLoading(true);
+    setSelectedAlbum(null);
+    try {
+      const res = await fetchWithTimeout(`http://localhost:8000/recording/${recordingId}/album`);
+      if (!res.ok) {
+        setMessage("No album found for this recording.");
+        setTimeout(() => setMessage(""), 3000);
+        return;
+      }
+      const data = await res.json();
+      setSelectedAlbum(data);
+    } catch (err) {
+      console.error("Album tracks fetch failed", err);
+      setMessage("Error loading album tracks.");
+      setTimeout(() => setMessage(""), 3000);
+    } finally {
+      setAlbumLoading(false);
+    }
+  };
+
+  const fetchProfileTopTracks = async (profile: UserProfile) => {
+    setSelectedProfile(profile);
+    setProfileTopTracks([]);
+    setProfileLoading(true);
+    try {
+      const res = await fetchWithTimeout(`http://localhost:8000/user/${profile.id}/top-tracks?n=5`);
+      if (!res.ok) return;
+      const data = await res.json();
+      setProfileTopTracks(data.songs || []);
+    } catch (err) {
+      console.error("Profile top tracks fetch failed", err);
+    } finally {
+      setProfileLoading(false);
+    }
+  };
+
   // Fetch recommendations
   const fetchHome = async () => {
   if (!activeUser) return;
   setLoading(true);
 
-  const cached = localStorage.getItem(`home:${activeUser.id}`);
-  if (cached) setSongs(JSON.parse(cached));
-
   try {
-    const res = await fetch(`http://localhost:8000/home/${activeUser.id}?n=8`);
+    localStorage.removeItem(`home:${activeUser.id}`);
+    const res = await fetch(`http://localhost:8000/recommend/${activeUser.id}?n=8&t=${Date.now()}`, { cache: "no-store" });
     const data = await res.json();
     setSongs(data.songs || []);
     setSource(data.source || "unknown");
-    localStorage.setItem(`home:${activeUser.id}`, JSON.stringify(data.songs || []));
   } catch (err) {
     setMessage("Error fetching home feed.");
     setSongs([]);
+  } finally {
+    setLoading(false);
   }
-  setLoading(false);
 };
 const playQueue = async (songList: Song[], startIndex: number = 0) => {
   if (!activeUser) return;
-  const remaining = songList.slice(startIndex + 1, startIndex + 11);
-  
-  // Guarda as próximas 10 no Redis
-  await fetch(`http://localhost:8000/queue/${activeUser.id}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(remaining)
-  });
-
-  setQueue(songList);
+  const selected = songList[startIndex];
+  if (!selected) return;
+  setQueue([]);
   setQueueIndex(startIndex);
-  playSong(songList[startIndex]);
+  playSong(selected);
 };
 
 const playingNextRef = useRef(false);
@@ -397,7 +469,8 @@ const playNext = async () => {
       const song = await res.json();
 
       setQueueIndex(prev => prev + 1);
-      playSong(song);
+      setQueue(prev => prev.slice(1));
+      playSong(song, false);
     } else {
       setIsPlaying(false);
       setQueue([]);
@@ -408,11 +481,12 @@ const playNext = async () => {
   }
 };
 
-  const playSong = async (song: Song) => {
+  const playSong = async (song: Song, refreshQueue: boolean = true) => {
     if (!activeUser) return;
     setCurrentSong(song);
     setIsPlaying(true);
     setCurrentTime(0);
+    setSelectedAlbum(null);
     try {
       await fetch("http://localhost:8000/event/play", {
         method: "POST",
@@ -420,18 +494,40 @@ const playNext = async () => {
         body: JSON.stringify({ user_id: activeUser.id, recording_id: song.id, duration_ms: 30000 })
       });
       setMessage(`Playing "${song.name}" - Kafka event sent!`);
+      if (refreshQueue) {
+        const queueRes = await fetchWithTimeout(
+          `http://localhost:8000/queue/${activeUser.id}/recommend-after/${song.id}?n=10`,
+          { method: "POST" },
+          60000
+        );
+        if (queueRes.ok) {
+          const recommendedQueue = await queueRes.json();
+          setQueue(Array.isArray(recommendedQueue) ? recommendedQueue : []);
+          setQueueIndex(0);
+        }
+      }
       
-      // WAIT 2 SECONDS for Kafka -> Spark -> Redis processing
+      // Wait for Kafka -> Spark -> Redis processing before reading recs:{user_id}.
       // THEN refresh recommendations to see live update!
       setTimeout(() => {
         fetchHome();
         setMessage(`Recommendations updated by Live Spark Stream!`);
         setTimeout(() => setMessage(""), 3000);
-      }, 2500);
+      }, 5000);
 
     } catch (err) {
       setMessage("Error sending Kafka event.");
     }
+  };
+
+  const togglePlayback = () => {
+    if (!currentSong) return;
+    if (currentTime >= duration) {
+      setCurrentTime(0);
+      setIsPlaying(true);
+      return;
+    }
+    setIsPlaying(prev => !prev);
   };
 
   const skipSong = async () => {
@@ -454,6 +550,7 @@ const playNext = async () => {
   const likeSong = async () => {
     if (!activeUser || !currentSong) return;
     try {
+      setLikedSongKeys(prev => new Set(prev).add(songKey(currentSong)));
       await fetch("http://localhost:8000/event/like", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -653,13 +750,20 @@ const playNext = async () => {
                    <div className="px-4 py-3 border-b border-white/5">
                      <p className="text-[10px] text-gray-500 uppercase font-bold tracking-widest mb-2">Switch Profile</p>
                      {activeUser && (
-                       <div className="flex items-center space-x-3 mb-1 min-w-0">
+                       <div
+                         className="flex items-center space-x-3 mb-1 min-w-0 cursor-pointer hover:bg-white/5 rounded p-2 -mx-2"
+                         onClick={() => {
+                           fetchProfileTopTracks(activeUser);
+                           setIsUserMenuOpen(false);
+                           handleTabChange('social');
+                         }}
+                       >
                           <div className="w-10 h-10 bg-green-500 rounded-full flex items-center justify-center text-black font-bold shrink-0">
                             {activeUser.username ? activeUser.username[0].toUpperCase() : "?"}
                           </div>
                           <div className="min-w-0 flex-1">
                             <p className="font-bold text-white text-sm truncate" title={activeUser.username || "Anonymous"}>{activeUser.username || "Anonymous"}</p>
-                            <p className="text-xs text-gray-400">ID: {activeUser.id}</p>
+                            <p className="text-xs text-gray-400">ID: {activeUser.id} • top tracks</p>
                           </div>
                        </div>
                      )}
@@ -761,12 +865,12 @@ const playNext = async () => {
                         <div className="w-full aspect-square bg-gray-800 rounded mb-4 shadow-2xl flex items-center justify-center relative overflow-hidden">
                           <Music className="h-16 w-16 text-gray-500" />
                           <div className={`absolute bottom-2 right-2 bg-green-500 rounded-full p-3 shadow-xl transition-all duration-300 flex items-center justify-center 
-                            ${currentSong?.id === song.id 
+                            ${isCurrentSong(song) 
                               ? 'opacity-100 translate-y-0' 
                               : 'opacity-0 translate-y-2 group-hover:opacity-100 group-hover:translate-y-0'
                             } hover:scale-105 hover:bg-green-400`}
                           >
-                            {currentSong?.id === song.id && isPlaying ? (
+                            {isCurrentSong(song) && isPlaying ? (
                               <Pause className="h-6 w-6 text-black fill-black" />
                             ) : (
                               <Play className="h-6 w-6 text-black fill-black ml-1" />
@@ -811,12 +915,12 @@ const playNext = async () => {
                           <div className="w-full aspect-square bg-gray-800 rounded mb-4 shadow-2xl flex items-center justify-center relative overflow-hidden">
                             <Music className="h-16 w-16 text-gray-500" />
                             <div className={`absolute bottom-2 right-2 bg-green-500 rounded-full p-3 shadow-xl transition-all duration-300 flex items-center justify-center 
-                              ${currentSong?.id === song.id 
+                              ${isCurrentSong(song) 
                                 ? 'opacity-100 translate-y-0' 
                                 : 'opacity-0 translate-y-2 group-hover:opacity-100 group-hover:translate-y-0'
                               } hover:scale-105 hover:bg-green-400`}
                             >
-                              {currentSong?.id === song.id && isPlaying ? (
+                              {isCurrentSong(song) && isPlaying ? (
                                 <Pause className="h-6 w-6 text-black fill-black" />
                               ) : (
                                 <Play className="h-6 w-6 text-black fill-black ml-1" />
@@ -865,7 +969,11 @@ const playNext = async () => {
                   </h3>
                   <div className="space-y-4 max-h-[400px] overflow-y-auto pr-2 custom-scrollbar">
                     {userFriends.length > 0 ? userFriends.map(u => (
-                      <div key={u.id} className="flex items-center space-x-4 p-3 bg-white/5 rounded-xl border border-white/5 hover:bg-white/10 transition group">
+                      <div
+                        key={u.id}
+                        className={`flex items-center space-x-4 p-3 rounded-xl border transition group cursor-pointer ${selectedProfile?.id === u.id ? 'bg-green-600/20 border-green-500/50' : 'bg-white/5 border-white/5 hover:bg-white/10'}`}
+                        onClick={() => fetchProfileTopTracks(u)}
+                      >
                         <div className="w-12 h-12 bg-gray-700 rounded-full flex items-center justify-center font-bold text-gray-300 shrink-0">
                           {u.username ? u.username[0].toUpperCase() : "?"}
                         </div>
@@ -888,6 +996,31 @@ const playNext = async () => {
                       <p className="text-gray-600 text-xs italic">You haven't added any friends yet.</p>
                     )}
                   </div>
+                  {selectedProfile && (
+                    <div className="mt-6 pt-5 border-t border-white/10">
+                      <h4 className="text-xs font-bold uppercase tracking-widest text-green-400 mb-3">
+                        Top 5 from {selectedProfile.username}
+                      </h4>
+                      <div className="space-y-2">
+                        {profileTopTracks.length > 0 ? profileTopTracks.map((song, i) => (
+                          <div
+                            key={`${song.id}-${i}`}
+                            className="flex items-center justify-between p-2 hover:bg-white/5 rounded cursor-pointer group"
+                            onClick={() => playQueue(profileTopTracks, i)}
+                          >
+                            <span className="text-xs text-gray-400 w-5">{i + 1}</span>
+                            <div className="min-w-0 flex-1">
+                              <p className="text-xs font-semibold truncate group-hover:text-green-400" title={song.name}>{song.name}</p>
+                              <p className="text-[10px] text-gray-500 truncate" title={song.artist}>{song.artist}</p>
+                            </div>
+                            <span className="text-[10px] text-gray-500 ml-2">{song.score?.toFixed(0)}</span>
+                          </div>
+                        )) : (
+                          <p className="text-xs text-gray-600 italic">{profileLoading ? "Loading..." : "No plays found."}</p>
+                        )}
+                      </div>
+                    </div>
+                  )}
                 </div>
 
                 {/* Friends Activity */}
@@ -1098,23 +1231,65 @@ const playNext = async () => {
       </div>
     </div>
 
+      {(selectedAlbum || albumLoading) && (
+        <div className="absolute bottom-24 left-4 right-4 md:left-72 md:right-8 z-40 bg-[#181818] border border-white/10 rounded-lg shadow-2xl max-h-80 overflow-hidden">
+          <div className="flex items-center justify-between px-4 py-3 border-b border-white/10">
+            <div className="min-w-0">
+              <p className="text-[10px] uppercase tracking-widest text-gray-500 font-bold">Album Tracks</p>
+              <h3 className="font-bold text-sm truncate">{selectedAlbum?.release_name || "Loading..."}</h3>
+            </div>
+            <button className="text-gray-400 hover:text-white text-sm px-2" onClick={() => setSelectedAlbum(null)}>
+              Close
+            </button>
+          </div>
+          <div className="overflow-y-auto custom-scrollbar max-h-64">
+            {albumLoading ? (
+              <div className="px-4 py-6 text-sm text-gray-500">Loading tracks...</div>
+            ) : selectedAlbum?.tracks.length ? selectedAlbum.tracks.map((song, i) => (
+              <div
+                key={`${song.id}-${i}`}
+                className="flex items-center px-4 py-2 hover:bg-white/5 cursor-pointer group"
+                onClick={() => playQueue(selectedAlbum.tracks, i)}
+              >
+                <span className="text-xs text-gray-500 w-10">{song.number || song.position || i + 1}</span>
+                <div className="min-w-0 flex-1">
+                  <p className="text-sm font-semibold truncate group-hover:text-green-400" title={song.name}>{song.name}</p>
+                  <p className="text-[10px] text-gray-500 truncate" title={song.artist}>{song.artist}</p>
+                </div>
+              </div>
+            )) : (
+              <div className="px-4 py-6 text-sm text-gray-500">No tracks found.</div>
+            )}
+          </div>
+        </div>
+      )}
+
       {/* Player Bar */}
       <div className="h-24 shrink-0 bg-black border-t border-white/5 flex items-center px-4 justify-between z-50">
         <div className="flex items-center w-1/3 min-w-0 pr-4">
           {currentSong ? (
+            (() => {
+              const isLiked = likedSongKeys.has(songKey(currentSong));
+              return (
             <>
-              <div className="w-14 h-14 bg-gray-800 rounded shadow-md flex items-center justify-center flex-shrink-0">
+              <button
+                className="w-14 h-14 bg-gray-800 rounded shadow-md flex items-center justify-center flex-shrink-0 hover:bg-gray-700 transition"
+                onClick={() => fetchAlbumTracks(currentSong.id)}
+                title="Show album tracks"
+              >
                  <Music className="h-6 w-6 text-gray-500" />
-              </div>
+              </button>
               <div className="ml-4 truncate min-w-0 flex-1">
                 <p className="text-white text-sm font-semibold truncate hover:underline cursor-pointer" title={currentSong.name}>{currentSong.name}</p>
                 <p className="text-gray-400 text-[11px] truncate hover:underline cursor-pointer" title={currentSong.artist}>{currentSong.artist}</p>
               </div>
               <Heart 
-                className={`h-4 w-4 ml-4 cursor-pointer flex-shrink-0 transition ${currentSong ? 'text-gray-400 hover:text-white hover:scale-110' : 'text-gray-600 cursor-not-allowed'}`} 
+                className={`h-4 w-4 ml-4 cursor-pointer flex-shrink-0 transition hover:scale-110 ${isLiked ? 'text-green-500 fill-green-500' : 'text-gray-400 hover:text-white'}`}
                 onClick={() => currentSong && likeSong()}
               />
             </>
+              );
+            })()
           ) : (
              <p className="text-gray-500 text-xs italic">Choose music from Hive cluster...</p>
           )}
@@ -1125,7 +1300,7 @@ const playNext = async () => {
             <SkipBack className="h-5 w-5 text-gray-400 cursor-not-allowed" />
             <button 
               className="bg-white text-black rounded-full w-8 h-8 flex items-center justify-center hover:scale-105 transition"
-              onClick={() => setIsPlaying(!isPlaying)}
+              onClick={togglePlayback}
             >
                {isPlaying ? <Pause className="h-4 w-4 fill-black" /> : <Play className="h-4 w-4 fill-black ml-0.5" />}
             </button>
@@ -1146,10 +1321,22 @@ const playNext = async () => {
           </div>
         </div>
 
-        <div className="w-1/3 flex justify-end items-center space-x-3 text-gray-400">
-           <Mic2 className="h-4 w-4" />
-           <Volume2 className="h-5 w-5" />
-           <div className="w-24 h-1 bg-white/20 rounded-full">
+        <div className="w-1/3 flex justify-end items-center space-x-3 text-gray-400 min-w-0">
+           {queue.length > 0 && (
+             <div className="hidden lg:block w-48 min-w-0">
+               <p className="text-[10px] uppercase tracking-widest text-gray-500 font-bold mb-1">Up Next</p>
+               <div className="space-y-0.5">
+                 {queue.slice(0, 3).map((song, i) => (
+                   <p key={`${song.id}-${i}`} className="text-[10px] truncate text-gray-300" title={`${song.name} - ${song.artist}`}>
+                     {i + 1}. {song.name}
+                   </p>
+                 ))}
+               </div>
+             </div>
+           )}
+           <Mic2 className="h-4 w-4 shrink-0" />
+           <Volume2 className="h-5 w-5 shrink-0" />
+           <div className="w-24 h-1 bg-white/20 rounded-full shrink-0">
              <div className="h-full bg-white rounded-full w-2/3"></div>
            </div>
         </div>

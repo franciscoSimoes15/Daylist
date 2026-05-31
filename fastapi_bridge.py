@@ -27,11 +27,16 @@ class ConnectionManager:
             self.active_connections.remove(websocket)
 
     async def broadcast(self, message: dict):
-        for connection in self.active_connections:
+        dead_connections = []
+        for connection in list(self.active_connections):
             try:
                 await connection.send_json(message)
             except Exception as e:
                 logger.error(f"Error broadcasting to client: {e}")
+                dead_connections.append(connection)
+
+        for connection in dead_connections:
+            self.disconnect(connection)
 
 manager = ConnectionManager()
 
@@ -83,6 +88,8 @@ app = FastAPI(title="Caveman Music API")
 async def log_requests(request, call_next):
     logger.info(f"Incoming request: {request.method} {request.url}")
     response = await call_next(request)
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Pragma"] = "no-cache"
     logger.info(f"Response status: {response.status_code}")
     return response
 
@@ -104,6 +111,8 @@ HIVE_SERVER2_PORT    = int(os.getenv("HIVE_SERVER2_PORT", 10000))
 HIVE_DATABASE        = os.getenv("HIVE_DATABASE", "francisco_jose_simoes")
 REDIS_HOST           = os.getenv("REDIS_HOST", "localhost")
 REDIS_PORT           = int(os.getenv("REDIS_PORT", 6379))
+ENABLE_NOTIFICATION_POLL = os.getenv("ENABLE_NOTIFICATION_POLL", "false").lower() == "true"
+APP_CACHE_ENABLED = os.getenv("APP_CACHE_ENABLED", "false").lower() == "true"
 
 # --- Kafka: ensure topics exist ---
 KAFKA_TOPICS = [KAFKA_TOPIC_PLAY, KAFKA_TOPIC_SKIP, KAFKA_TOPIC_LIKE]
@@ -170,6 +179,38 @@ ARTIST_JOIN = """
     JOIN curated_artist a ON acn.artist = a.id
 """
 
+
+def merge_song_artist_rows(rows, has_score: bool = False, limit: Optional[int] = None) -> List[dict]:
+    merged = {}
+    for row in rows:
+        key = (int(row[0]), str(row[1]))
+        artist = str(row[2])
+        if key not in merged:
+            merged[key] = {
+                "id": key[0],
+                "name": key[1],
+                "artists": [],
+            }
+            if has_score:
+                merged[key]["score"] = float(row[3])
+        if artist not in merged[key]["artists"]:
+            merged[key]["artists"].append(artist)
+        if has_score:
+            merged[key]["score"] = max(float(merged[key]["score"]), float(row[3]))
+
+    songs = []
+    for song in merged.values():
+        item = {
+            "id": song["id"],
+            "name": song["name"],
+            "artist": ", ".join(song["artists"]),
+        }
+        if has_score:
+            item["score"] = song["score"]
+        songs.append(item)
+
+    return songs[:limit] if limit else songs
+
 # --- Pydantic Models ---
 class PlayEvent(BaseModel):
     user_id: int
@@ -196,11 +237,24 @@ class SongInfoWithScore(BaseModel):
     artist: str
     score: Optional[float] = None
 
+class TrackInfo(SongInfoWithScore):
+    position: int
+    number: str
+
+class RecordingAlbumResponse(BaseModel):
+    release_id: int
+    release_name: str
+    tracks: List[TrackInfo]
+
 class UserProfile(BaseModel):
     id: int
     username: str
     age: int
     country: str
+
+class UserTopTracksResponse(BaseModel):
+    user: UserProfile
+    songs: List[SongInfoWithScore]
 
 class RecommendationResponse(BaseModel):
     source: str
@@ -226,14 +280,42 @@ class SearchResponse(BaseModel):
 # LOGIC
 # ============================================================
 
-def get_hive_users(n: int = 20) -> List[UserProfile]:
-    if r_cache:
+FALLBACK_USERNAMES = {"guest", "mockuser", "manual"}
+
+
+def is_real_hive_user(user: UserProfile) -> bool:
+    return (
+        user.id > 0
+        and bool(user.username)
+        and user.username.strip().lower() not in FALLBACK_USERNAMES
+    )
+
+
+def get_hive_users(n: int = 20, use_cache: bool = True) -> List[UserProfile]:
+    if APP_CACHE_ENABLED and use_cache and r_cache:
         cached = r_cache.get("users:list")
         if cached:
-            return [UserProfile(**u) for u in json.loads(cached)]
+            try:
+                logger.info("Users fetched from Redis cache")
+                cached_rows = json.loads(cached)
+                users = []
+                for row in cached_rows:
+                    users.append(UserProfile(
+                        id=int(row.get("id", row.get("user_id"))),
+                        username=str(row["username"]),
+                        age=int(row.get("age") or 0),
+                        country=str(row.get("country") or "")
+                    ))
+                if users and all(is_real_hive_user(user) for user in users):
+                    return users
+                logger.warning("Ignoring fallback or empty users found in Redis cache")
+            except Exception as e:
+                logger.warning(f"Ignoring invalid Redis users cache: {e}")
+            r_cache.delete("users:list")
     if not HIVE_AVAILABLE:
         return [UserProfile(id=1, username="MockUser", age=25, country="PT")]
     try:
+        logger.info("Users fetched from Hive")
         conn = hive_conn()
         cursor = conn.cursor()
         cursor.execute(f"""
@@ -248,7 +330,7 @@ def get_hive_users(n: int = 20) -> List[UserProfile]:
                 users.append(UserProfile(id=int(r[0]), username=str(r[1]),
                                          age=int(r[2]) if r[2] else 0, country=str(r[3])))
             except: continue
-        if r_cache and users:
+        if APP_CACHE_ENABLED and r_cache and users and all(is_real_hive_user(user) for user in users):
             r_cache.setex("users:list", 600, json.dumps([u.dict() for u in users]))
         return users
     except Exception as e:
@@ -282,9 +364,9 @@ def get_batch_recommendations(user_id: int, n: int = 8) -> dict:
             WHERE h.user_id = {user_id}
             GROUP BY r.id, r.name, a.name
             ORDER BY count(*) DESC
-            LIMIT {n}
+            LIMIT {n * 4}
         """)
-        songs = [{"id": int(r[0]), "name": str(r[1]), "artist": str(r[2])} for r in cursor.fetchall()]
+        songs = merge_song_artist_rows(cursor.fetchall(), limit=n)
 
         # 3. Cold start — user has no history
         if not songs:
@@ -293,11 +375,11 @@ def get_batch_recommendations(user_id: int, n: int = 8) -> dict:
                 SELECT r.id, r.name, a.name
                 FROM curated_recording r
                 {ARTIST_JOIN}
-                LIMIT {n}
+                LIMIT {n * 4}
             """)
-            songs = [{"id": int(r[0]), "name": str(r[1]), "artist": str(r[2])} for r in cursor.fetchall()]
+            songs = merge_song_artist_rows(cursor.fetchall(), limit=n)
 
-        if r_cache and songs:
+        if APP_CACHE_ENABLED and r_cache and songs:
             r_cache.setex(cache_key, 600, json.dumps(songs))
 
         return {"source": "hive_batch", "songs": songs}
@@ -312,7 +394,7 @@ def get_playlist_by_time(user_id: int, time_of_day: str, n: int = 10) -> List[di
     time_of_day values: morning | afternoon | night  (as stored in feature-engineering)
     """
     cache_key = f"playlist:{user_id}:{time_of_day}"
-    if r_cache:
+    if APP_CACHE_ENABLED and r_cache:
         cached = r_cache.get(cache_key)
         if cached:
             return json.loads(cached)
@@ -331,11 +413,10 @@ def get_playlist_by_time(user_id: int, time_of_day: str, n: int = 10) -> List[di
             WHERE tp.user_id = {user_id}
               AND lower(tp.time_of_day) = lower('{time_of_day}')
             ORDER BY tp.play_count DESC
-            LIMIT {n}
+            LIMIT {n * 4}
         """)
-        songs = [{"id": int(r[0]), "name": str(r[1]), "artist": str(r[2]), "score": float(r[3])}
-                 for r in cursor.fetchall()]
-        if r_cache and songs:
+        songs = merge_song_artist_rows(cursor.fetchall(), has_score=True, limit=n)
+        if APP_CACHE_ENABLED and r_cache and songs:
             r_cache.setex(cache_key, 600, json.dumps(songs))
         return songs
     except Exception as e:
@@ -345,7 +426,7 @@ def get_playlist_by_time(user_id: int, time_of_day: str, n: int = 10) -> List[di
 
 def get_user_friends(user_id: int) -> List[UserProfile]:
     cache_key = f"friends_list:{user_id}"
-    if r_cache:
+    if APP_CACHE_ENABLED and r_cache:
         cached = r_cache.get(cache_key)
         if cached:
             return [UserProfile(**u) for u in json.loads(cached)]
@@ -367,7 +448,7 @@ def get_user_friends(user_id: int) -> List[UserProfile]:
                 friends.append(UserProfile(id=int(r[0]), username=str(r[1]),
                                          age=int(r[2]) if r[2] else 0, country=str(r[3])))
             except: continue
-        if r_cache and friends:
+        if APP_CACHE_ENABLED and r_cache and friends:
             r_cache.setex(cache_key, 600, json.dumps([f.dict() for f in friends]))
         return friends
     except Exception as e:
@@ -379,7 +460,7 @@ def get_friend_history(user_id: int, n: int = 20) -> List[dict]:
     Uses curated_friend_history — songs played by friends, aggregated.
     """
     cache_key = f"friends:{user_id}"
-    if r_cache:
+    if APP_CACHE_ENABLED and r_cache:
         cached = r_cache.get(cache_key)
         if cached:
             return json.loads(cached)
@@ -397,11 +478,10 @@ def get_friend_history(user_id: int, n: int = 20) -> List[dict]:
             {ARTIST_JOIN}
             WHERE fh.user_id = {user_id}
             ORDER BY fh.friend_plays DESC
-            LIMIT {n}
+            LIMIT {n * 4}
         """)
-        songs = [{"id": int(r[0]), "name": str(r[1]), "artist": str(r[2]), "score": float(r[3])}
-                 for r in cursor.fetchall()]
-        if r_cache and songs:
+        songs = merge_song_artist_rows(cursor.fetchall(), has_score=True, limit=n)
+        if APP_CACHE_ENABLED and r_cache and songs:
             r_cache.setex(cache_key, 300, json.dumps(songs))
         return songs
     except Exception as e:
@@ -414,7 +494,7 @@ def get_notifications(user_id: int) -> List[dict]:
     Uses curated_notifications — new releases from favourite artists.
     """
     cache_key = f"notif:{user_id}"
-    if r_cache:
+    if APP_CACHE_ENABLED and r_cache:
         cached = r_cache.get(cache_key)
         if cached:
             return json.loads(cached)
@@ -437,7 +517,7 @@ def get_notifications(user_id: int) -> List[dict]:
                    "release_id": int(r[2]), "release_name": str(r[3]),
                    "notified_at": str(r[4])}
                   for r in cursor.fetchall()]
-        if r_cache and notifs:
+        if APP_CACHE_ENABLED and r_cache and notifs:
             r_cache.setex(cache_key, 300, json.dumps(notifs))
         return notifs
     except Exception as e:
@@ -457,7 +537,7 @@ def search_tracks(query: str, n: int = 20) -> List[dict]:
     For true vector semantic search: replace with FAISS/pgvector + song2vec embeddings.
     """
     cache_key = f"search:{query.lower().strip()}"
-    if r_cache:
+    if APP_CACHE_ENABLED and r_cache:
         cached = r_cache.get(cache_key)
         if cached:
             return json.loads(cached)
@@ -492,10 +572,9 @@ def search_tracks(query: str, n: int = 20) -> List[dict]:
             WHERE lower(r.name) LIKE '%{q}%'
                OR lower(a.name) LIKE '%{q}%'
             ORDER BY score DESC
-            LIMIT {n}
+            LIMIT {n * 4}
         """)
-        results = [{"id": int(r[0]), "name": str(r[1]), "artist": str(r[2]), "score": float(r[3])}
-                   for r in cursor.fetchall()]
+        results = merge_song_artist_rows(cursor.fetchall(), has_score=True, limit=n)
 
         # Enrich with tag matches if results < n
         if len(results) < n:
@@ -507,19 +586,19 @@ def search_tracks(query: str, n: int = 20) -> List[dict]:
                 JOIN curated_recording r ON rt.recording = r.id
                 {ARTIST_JOIN}
                 WHERE lower(t.name) LIKE '%{q}%'
-                LIMIT {n}
+                LIMIT {n * 4}
             """)
-            for r in cursor.fetchall():
-                rid = int(r[0])
+            for r in merge_song_artist_rows(cursor.fetchall(), has_score=True, limit=n):
+                rid = int(r["id"])
                 if rid not in existing_ids:
-                    results.append({"id": rid, "name": str(r[1]), "artist": str(r[2]), "score": 1.0})
+                    results.append(r)
                     existing_ids.add(rid)
                 if len(results) >= n:
                     break
 
         results = sorted(results, key=lambda x: x["score"], reverse=True)[:n]
 
-        if r_cache and results:
+        if APP_CACHE_ENABLED and r_cache and results:
             r_cache.setex(cache_key, 300, json.dumps(results))
 
         return results
@@ -543,7 +622,7 @@ def send_kafka_event(topic: str, data: dict):
 
 def get_artist_songs(artist_id: int, n: int = 10) -> List[dict]:
     cache_key = f"artist:{artist_id}:songs"
-    if r_cache:
+    if APP_CACHE_ENABLED and r_cache:
         cached = r_cache.get(cache_key)
         if cached: return json.loads(cached)
     
@@ -561,16 +640,142 @@ def get_artist_songs(artist_id: int, n: int = 10) -> List[dict]:
             WHERE a.id = {artist_id}
             GROUP BY r.id, r.name, a.name
             ORDER BY popularity DESC
-            LIMIT {n}
+            LIMIT {n * 4}
         """)
-        songs = [{"id": int(r[0]), "name": str(r[1]), "artist": str(r[2]), "score": float(r[3])}
-                 for r in cursor.fetchall()]
-        if r_cache and songs:
+        songs = merge_song_artist_rows(cursor.fetchall(), has_score=True, limit=n)
+        if APP_CACHE_ENABLED and r_cache and songs:
             r_cache.setex(cache_key, 600, json.dumps(songs))
         return songs
     except Exception as e:
         logger.error(f"Artist songs fetch failed: {e}")
         return []
+
+def get_user_top_tracks(user_id: int, n: int = 5) -> List[dict]:
+    cache_key = f"user:{user_id}:top_tracks:{n}"
+    if APP_CACHE_ENABLED and r_cache:
+        cached = r_cache.get(cache_key)
+        if cached:
+            return json.loads(cached)
+
+    if not HIVE_AVAILABLE:
+        return []
+
+    try:
+        conn = hive_conn()
+        cursor = conn.cursor()
+        cursor.execute(f"""
+            SELECT r.id, r.name, a.name, count(*) as plays
+            FROM curated_history h
+            JOIN curated_recording r ON h.recording_id = r.id
+            {ARTIST_JOIN}
+            WHERE h.user_id = {user_id}
+            GROUP BY r.id, r.name, a.name
+            ORDER BY plays DESC
+            LIMIT {n * 4}
+        """)
+        songs = merge_song_artist_rows(cursor.fetchall(), has_score=True, limit=n)
+        if APP_CACHE_ENABLED and r_cache and songs:
+            r_cache.setex(cache_key, 600, json.dumps(songs))
+        return songs
+    except Exception as e:
+        logger.error(f"User top tracks fetch failed: {e}")
+        return []
+
+def get_recording_album_tracks(recording_id: int) -> Optional[dict]:
+    cache_key = f"recording:{recording_id}:album"
+    if APP_CACHE_ENABLED and r_cache:
+        cached = r_cache.get(cache_key)
+        if cached:
+            return json.loads(cached)
+
+    if not HIVE_AVAILABLE:
+        return None
+
+    try:
+        conn = hive_conn()
+        cursor = conn.cursor()
+        cursor.execute(f"""
+            SELECT rel.id, rel.name
+            FROM curated_track t
+            JOIN curated_medium m ON t.medium = m.id
+            JOIN curated_release rel ON m.release = rel.id
+            WHERE t.recording = {recording_id}
+            ORDER BY rel.id
+            LIMIT 1
+        """)
+        release = cursor.fetchone()
+        if not release:
+            return None
+
+        release_id = int(release[0])
+        cursor.execute(f"""
+            SELECT
+                r.id,
+                COALESCE(t.name, r.name) AS track_name,
+                a.name AS artist_name,
+                COALESCE(m.position, 0) AS medium_position,
+                COALESCE(t.position, 0) AS track_position,
+                COALESCE(t.number, CAST(t.position AS STRING)) AS track_number,
+                count(h.user_id) AS plays
+            FROM curated_track t
+            JOIN curated_medium m ON t.medium = m.id
+            JOIN curated_recording r ON t.recording = r.id
+            {ARTIST_JOIN}
+            LEFT JOIN curated_history h ON r.id = h.recording_id
+            WHERE m.release = {release_id}
+            GROUP BY r.id, COALESCE(t.name, r.name), a.name, COALESCE(m.position, 0),
+                     COALESCE(t.position, 0), COALESCE(t.number, CAST(t.position AS STRING))
+            ORDER BY medium_position, track_position
+            LIMIT 200
+        """)
+
+        merged = {}
+        ordering = {}
+        for row in cursor.fetchall():
+            rid = int(row[0])
+            name = str(row[1])
+            artist = str(row[2])
+            medium_position = int(row[3] or 0)
+            track_position = int(row[4] or 0)
+            track_number = str(row[5] or track_position)
+            plays = float(row[6] or 0)
+            key = (rid, name)
+            ordering[key] = (medium_position, track_position)
+            if key not in merged:
+                merged[key] = {
+                    "id": rid,
+                    "name": name,
+                    "artist": artist,
+                    "position": track_position,
+                    "number": track_number,
+                    "score": plays,
+                }
+            elif artist not in merged[key]["artist"].split(", "):
+                merged[key]["artist"] = f'{merged[key]["artist"]}, {artist}'
+
+        tracks = [merged[key] for key in sorted(merged, key=lambda item: ordering[item])]
+        album = {"release_id": release_id, "release_name": str(release[1]), "tracks": tracks}
+        if APP_CACHE_ENABLED and r_cache and tracks:
+            r_cache.setex(cache_key, 600, json.dumps(album))
+        return album
+    except Exception as e:
+        logger.error(f"Recording album fetch failed: {e}")
+        return None
+
+def build_recommended_queue(user_id: int, current_recording_id: int, n: int = 10) -> List[dict]:
+    result = get_batch_recommendations(user_id, max(n + 8, 20))
+    seen = {current_recording_id}
+    queue = []
+    for song in result.get("songs", []):
+        sid = int(song["id"])
+        if sid in seen:
+            continue
+        seen.add(sid)
+        queue.append(song)
+        if len(queue) >= n:
+            break
+    set_user_queue(user_id, queue)
+    return queue
 
 def get_user_queue(user_id: int) -> List[dict]:
     queue_key = f"queue:{user_id}"
@@ -602,7 +807,7 @@ def pop_next_from_queue(user_id: int) -> Optional[dict]:
 def get_user_history_home(user_id: int, n: int = 8) -> List[dict]:
     """Histórico recente do user para a Home — Redis primeiro, Hive como fallback."""
     cache_key = f"home:{user_id}"
-    if r_cache:
+    if APP_CACHE_ENABLED and r_cache:
         cached = r_cache.get(cache_key)
         if cached:
             return json.loads(cached)
@@ -621,11 +826,10 @@ def get_user_history_home(user_id: int, n: int = 8) -> List[dict]:
             WHERE h.user_id = {user_id}
             GROUP BY r.id, r.name, a.name
             ORDER BY count(*) DESC
-            LIMIT {n}
+            LIMIT {n * 4}
         """)
-        songs = [{"id": int(r[0]), "name": str(r[1]), "artist": str(r[2])}
-                 for r in cursor.fetchall()]
-        if r_cache and songs:
+        songs = merge_song_artist_rows(cursor.fetchall(), limit=n)
+        if APP_CACHE_ENABLED and r_cache and songs:
             r_cache.setex(cache_key, 600, json.dumps(songs))
         return songs
     except Exception as e:
@@ -645,8 +849,8 @@ def health():
     }
 
 @app.get("/users", response_model=List[UserProfile])
-def list_users():
-    return get_hive_users()
+def list_users(use_cache: bool = False):
+    return get_hive_users(use_cache=use_cache)
 
 # --- Recommendations ---
 @app.get("/recommend/{user_id}", response_model=RecommendationResponse)
@@ -686,6 +890,23 @@ def artist_songs(artist_id: int, n: int = 10):
     songs = get_artist_songs(artist_id, n)
     return [SongInfoWithScore(**s) for s in songs]
 
+@app.get("/user/{user_id}/top-tracks", response_model=UserTopTracksResponse)
+def user_top_tracks(user_id: int, n: int = 5):
+    users = [u for u in get_hive_users(n=100) if u.id == user_id]
+    if users:
+        user = users[0]
+    else:
+        user = UserProfile(id=user_id, username=f"User {user_id}", age=0, country="")
+    songs = get_user_top_tracks(user_id, n)
+    return UserTopTracksResponse(user=user, songs=[SongInfoWithScore(**s) for s in songs])
+
+@app.get("/recording/{recording_id}/album", response_model=RecordingAlbumResponse)
+def recording_album(recording_id: int):
+    album = get_recording_album_tracks(recording_id)
+    if not album:
+        raise HTTPException(status_code=404, detail="Album not found for recording")
+    return RecordingAlbumResponse(**album)
+
 # --- Semantic Search ---
 @app.get("/search", response_model=SearchResponse)
 def search(q: str, n: int = 20):
@@ -709,6 +930,11 @@ def set_queue(user_id: int, songs: List[SongInfo]):
     set_user_queue(user_id, [s.dict() for s in songs])
     return {"status": "ok", "queued": len(songs)}
 
+@app.post("/queue/{user_id}/recommend-after/{recording_id}", response_model=List[SongInfo])
+def recommended_queue_after_play(user_id: int, recording_id: int, n: int = 10):
+    songs = build_recommended_queue(user_id, recording_id, n)
+    return [SongInfo(**s) for s in songs]
+
 @app.get("/queue/{user_id}/next")
 def next_in_queue(user_id: int):
     song = pop_next_from_queue(user_id)
@@ -718,10 +944,7 @@ def next_in_queue(user_id: int):
 
 @app.get("/home/{user_id}")
 def home_feed(user_id: int, n: int = 8):
-    songs = get_user_history_home(user_id, n)
-    # Quando um user toca uma música, a cache home é invalidada
-    # e na próxima visita mostra o histórico atualizado
-    return {"source": "redis_history" if r_cache else "hive", "songs": songs}
+    return get_batch_recommendations(user_id, n)
 
 # --- Events → Kafka ---
 @app.post("/event/play")
@@ -768,7 +991,7 @@ async def broadcast_random_song():
         pool_key = "broadcast:song_pool"
         pool = None
 
-        if r_cache:
+        if APP_CACHE_ENABLED and r_cache:
             cached = r_cache.get(pool_key)
             if cached:
                 pool = json.loads(cached)
@@ -780,11 +1003,10 @@ async def broadcast_random_song():
                 SELECT r.id, r.name, a.name
                 FROM curated_recording r
                 {ARTIST_JOIN}
-                LIMIT 500
+                LIMIT 2000
             """)
-            pool = [{"id": int(r[0]), "name": str(r[1]), "artist": str(r[2])}
-                    for r in cursor.fetchall()]
-            if r_cache and pool:
+            pool = merge_song_artist_rows(cursor.fetchall(), limit=500)
+            if APP_CACHE_ENABLED and r_cache and pool:
                 r_cache.setex(pool_key, 3600, json.dumps(pool))
 
         users = get_hive_users()
@@ -821,6 +1043,10 @@ async def poll_notifications(loop):
     await asyncio.sleep(15)  # espera inicial
     while True:
         try:
+            if not manager.active_connections:
+                await asyncio.sleep(30)
+                continue
+
             users = get_hive_users()
             for user in users:
                 cache_key = f"notif:{user.id}"
@@ -868,7 +1094,10 @@ async def startup_event():
             daemon=True
         )
         thread.start()
-    asyncio.create_task(poll_notifications(asyncio.get_running_loop()))
+    if ENABLE_NOTIFICATION_POLL:
+        asyncio.create_task(poll_notifications(asyncio.get_running_loop()))
+    else:
+        logger.info("Notification poll disabled. Set ENABLE_NOTIFICATION_POLL=true to enable it.")
 
 
 @app.post("/dev/simulate-notification")

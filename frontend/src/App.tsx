@@ -103,53 +103,53 @@ function App() {
     return `${mins}:${secs.toString().padStart(2, "0")}`;
   };
 
+  const notifCounterRef = useRef(0);
   // WebSocket for notifications
-  useEffect(() => {
+ useEffect(() => {
   const ws = new WebSocket("ws://localhost:8000/ws");
   ws.onmessage = (event) => {
     try {
       const payload = JSON.parse(event.data);
       if (payload.type === "kafka_event") {
         const { user_id, recording_id } = payload.data;
+        const notifId = ++notifCounterRef.current;
         const newNotif = {
-          id: Date.now(),
+          id: notifId,
           message: `Kafka: User ${user_id} played Song ${recording_id}`
         };
         setNotifications(prev => [newNotif, ...prev].slice(0, 5));
         setTimeout(() => {
-          setNotifications(prev => prev.filter(n => n.id !== newNotif.id));
+          setNotifications(prev => prev.filter(n => n.id !== notifId));
         }, 5000);
       } else if (payload.type === "broadcast_play") {
-        // FIX: usa o ref para ter sempre o valor atual
         const currentUserId = String(activeUserRef.current?.id);
         const song = payload.assignments?.[currentUserId];
         if (song) {
           setCurrentSong(song);
           setIsPlaying(true);
           setCurrentTime(0);
+          const notifId = ++notifCounterRef.current;
           const newNotif = {
-            id: Date.now(),
+            id: notifId,
             message: `🎵 Broadcast: "${song.name}" — ${song.artist}`
           };
           setNotifications(prev => [newNotif, ...prev].slice(0, 5));
           setTimeout(() => {
-            setNotifications(prev => prev.filter(n => n.id !== newNotif.id));
+            setNotifications(prev => prev.filter(n => n.id !== notifId));
           }, 6000);
         }
-      }
-      else if (payload.type === "new_notification") {
+      } else if (payload.type === "new_notification") {
         if (String(payload.user_id) === String(activeUserRef.current?.id)) {
           setNotifSeen(false);
-          // Mostra o toast azul
+          const notifId = ++notifCounterRef.current;
           const newNotif = {
-            id: Date.now(),
-            message: `Nova notificação: ${payload.artist_name} lançou "${payload.release_name}"`
+            id: notifId,
+            message: `🔔 ${payload.artist_name} lançou "${payload.release_name}"`
           };
           setNotifications(prev => [newNotif, ...prev].slice(0, 5));
           setTimeout(() => {
-            setNotifications(prev => prev.filter(n => n.id !== newNotif.id));
+            setNotifications(prev => prev.filter(n => n.id !== notifId));
           }, 6000);
-          // Atualiza a lista de notificações
           fetchNotifications();
         }
       }
@@ -444,15 +444,11 @@ const playNext = async () => {
       });
       setMessage("Skip event sent to Kafka!");
       setTimeout(() => setMessage(""), 3000);
-      
-      // Move to next song (mock)
-      const currentIndex = songs.findIndex(s => s.id === currentSong.id);
-      if (currentIndex !== -1 && currentIndex < songs.length - 1) {
-        playSong(songs[currentIndex + 1]);
-      }
     } catch (err) {
       console.error("Skip event failed", err);
     }
+    // Avança pela queue do Redis (igual ao fim da música)
+    await playNext();
   };
 
   const likeSong = async () => {
@@ -1135,7 +1131,7 @@ const playNext = async () => {
             </button>
             <SkipForward
               className={`h-5 w-5 transition ${currentSong ? 'text-white cursor-pointer hover:scale-110' : 'text-gray-600 cursor-not-allowed'}`}
-              onClick={() => currentSong && playNext()}
+              onClick={() => currentSong && skipSong()}
             />
           </div>
           <div className="w-full flex items-center space-x-2">

@@ -816,7 +816,37 @@ async def broadcast_random_song():
         logger.error(f"Broadcast failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+async def poll_notifications(loop):
+    """Verifica de 30 em 30s se há novas notificações para algum user."""
+    await asyncio.sleep(15)  # espera inicial
+    while True:
+        try:
+            users = get_hive_users()
+            for user in users:
+                cache_key = f"notif:{user.id}"
+                old_cached = r_cache.get(cache_key) if r_cache else None
+                old_ids = set()
+                if old_cached:
+                    old_ids = {n["release_id"] for n in json.loads(old_cached)}
+                
+                # Invalida cache para forçar re-fetch
+                if r_cache:
+                    r_cache.delete(cache_key)
+                
+                fresh = get_notifications(user.id)
+                new_ones = [n for n in fresh if n["release_id"] not in old_ids]
+                
+                for notif in new_ones:
+                    await manager.broadcast({
+                        "type": "new_notification",
+                        "user_id": user.id,
+                        "artist_name": notif["artist_name"],
+                        "release_name": notif["release_name"]
+                    })
+        except Exception as e:
+            logger.error(f"Notification poll failed: {e}")
         
+        await asyncio.sleep(30)  # verifica a cada 30s        
 
 # --- WebSocket ---
 @app.websocket("/ws")
@@ -838,7 +868,19 @@ async def startup_event():
             daemon=True
         )
         thread.start()
+    asyncio.create_task(poll_notifications(asyncio.get_running_loop()))
 
+
+@app.post("/dev/simulate-notification")
+async def simulate_notification(user_id: int, artist_name: str = "Radiohead", release_name: str = "New Album 2025"):
+    await manager.broadcast({
+        "type": "new_notification",
+        "user_id": user_id,
+        "artist_name": artist_name,
+        "release_name": release_name
+    })
+    return {"status": "simulated", "user_id": user_id, "artist_name": artist_name}
+    
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)

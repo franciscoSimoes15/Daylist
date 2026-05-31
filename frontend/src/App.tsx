@@ -19,7 +19,8 @@ import {
   User as UserIcon,
   ChevronDown,
   Globe,
-  Calendar
+  Calendar,
+  Bell
 } from 'lucide-react';
 import './index.css';
 
@@ -81,6 +82,9 @@ function App() {
   const [queue, setQueue] = useState<Song[]>([]);
   const [queueIndex, setQueueIndex] = useState<number>(0);
 
+  const [isNotifMenuOpen, setIsNotifMenuOpen] = useState<boolean>(false);
+  const [notifSeen, setNotifSeen] = useState<boolean>(false);
+
   const activeUserRef = useRef<UserProfile | null>(null);
   useEffect(() => {
     activeUserRef.current = activeUser;
@@ -131,6 +135,22 @@ function App() {
           setTimeout(() => {
             setNotifications(prev => prev.filter(n => n.id !== newNotif.id));
           }, 6000);
+        }
+      }
+      else if (payload.type === "new_notification") {
+        if (String(payload.user_id) === String(activeUserRef.current?.id)) {
+          setNotifSeen(false);
+          // Mostra o toast azul
+          const newNotif = {
+            id: Date.now(),
+            message: `Nova notificação: ${payload.artist_name} lançou "${payload.release_name}"`
+          };
+          setNotifications(prev => [newNotif, ...prev].slice(0, 5));
+          setTimeout(() => {
+            setNotifications(prev => prev.filter(n => n.id !== newNotif.id));
+          }, 6000);
+          // Atualiza a lista de notificações
+          fetchNotifications();
         }
       }
     } catch (err) {
@@ -306,6 +326,7 @@ function App() {
     } catch (err) {
       console.error("Notifications fetch failed", err);
       setUserNotifications([]);
+      setNotifSeen(false);
     }
   };
 
@@ -326,11 +347,16 @@ function App() {
   const fetchHome = async () => {
   if (!activeUser) return;
   setLoading(true);
+
+  const cached = localStorage.getItem(`home:${activeUser.id}`);
+  if (cached) setSongs(JSON.parse(cached));
+
   try {
     const res = await fetch(`http://localhost:8000/home/${activeUser.id}?n=8`);
     const data = await res.json();
     setSongs(data.songs || []);
     setSource(data.source || "unknown");
+    localStorage.setItem(`home:${activeUser.id}`, JSON.stringify(data.songs || []));
   } catch (err) {
     setMessage("Error fetching home feed.");
     setSongs([]);
@@ -551,10 +577,66 @@ const playNext = async () => {
             <Disc3 className="h-3.5 w-3.5" />
             <span>Broadcast</span>
           </button>
-          <div className="flex items-center space-x-4 relative">
+          <div className="flex items-center space-x-3 relative">
+            {/* Sino de Notificações */}
+            <div className="relative">
+              <button
+                onClick={() => { setIsNotifMenuOpen(!isNotifMenuOpen); setIsUserMenuOpen(false); setNotifSeen(true); }}
+                className="relative flex items-center justify-center w-8 h-8 rounded-full bg-black hover:bg-[#282828] border border-gray-800 transition"
+              >
+                <Bell className="h-6 w-6 text-gray-300" />
+                {userNotifications.length > 0 && !notifSeen && (
+                  <span className="absolute -top-1 -right-0 w-3 h-3 bg-green-500 rounded-full text-[9px] font-bold text-black flex items-center justify-center">
+                    {userNotifications.length > 1 ? ' ' : userNotifications.length}
+                  </span>
+                )}
+              </button>
+
+              {isNotifMenuOpen && (
+                <>
+                  <div className="fixed inset-0 z-40" onClick={() => setIsNotifMenuOpen(false)}></div>
+                  <div className="absolute top-full right-0 mt-2 w-80 bg-[#282828] rounded shadow-2xl border border-white/10 z-50 overflow-hidden py-1 animate-in fade-in zoom-in-95 duration-100">
+                    <div className="px-4 py-3 border-b border-white/5 flex items-center justify-between">
+                      <p className="text-[10px] text-gray-500 uppercase font-bold tracking-widest">Notificações</p>
+                      <span className="text-[10px] text-green-500 font-bold">{userNotifications.length} novas</span>
+                    </div>
+
+                    <div className="max-h-80 overflow-y-auto custom-scrollbar">
+                      {userNotifications.length > 0 ? userNotifications.map((notif, i) => (
+                        <div
+                          key={i}
+                          className="px-4 py-3 hover:bg-white/10 transition border-b border-white/5 cursor-pointer"
+                          onClick={() => {
+                            fetchArtistSongs(notif.artist_id, notif.artist_name);
+                            setIsNotifMenuOpen(false);
+                            handleTabChange('social');
+                          }}
+                        >
+                          <div className="flex items-center space-x-3">
+                            <div className="w-8 h-8 bg-blue-600/20 rounded-full flex items-center justify-center text-blue-400 font-bold text-xs shrink-0">
+                              {notif.artist_name[0]}
+                            </div>
+                            <div className="flex-1 min-w-0">
+                              <p className="text-xs font-bold text-white truncate">{notif.artist_name}</p>
+                              <p className="text-[10px] text-gray-400 truncate">Novo lançamento: {notif.release_name}</p>
+                              <p className="text-[9px] text-gray-600 mt-0.5">{notif.notified_at}</p>
+                            </div>
+                            <Mic2 className="h-3.5 w-3.5 text-blue-400 shrink-0" />
+                          </div>
+                        </div>
+                      )) : (
+                        <div className="px-4 py-8 text-center text-gray-600 text-xs italic">
+                          Sem notificações de momento.
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                </>
+              )}
+            </div>
              {/* Profile Dropdown Toggle */}
              <button 
-               onClick={() => setIsUserMenuOpen(!isUserMenuOpen)}
+               onClick={() => {setIsUserMenuOpen(!isUserMenuOpen);  setIsNotifMenuOpen(false);}}
                className="flex items-center space-x-2 bg-black hover:bg-[#282828] p-1 pr-3 rounded-full border border-gray-800 transition cursor-pointer"
              >
                <div className="w-7 h-7 bg-gradient-to-tr from-green-600 to-green-400 rounded-full flex items-center justify-center shadow-inner">

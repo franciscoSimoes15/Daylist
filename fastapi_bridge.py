@@ -8,10 +8,159 @@ import time
 import os
 import json
 import logging
+import socket
+import subprocess
+import uuid
+from pathlib import Path
 from typing import List, Optional
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+def load_local_env(env_path: str = ".env") -> None:
+    """Load simple KEY=VALUE pairs from the project .env without requiring python-dotenv."""
+    path = Path(__file__).resolve().with_name(env_path)
+    if not path.exists():
+        return
+
+    for line in path.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        key, value = stripped.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key:
+            os.environ.setdefault(key, value)
+
+
+def env_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except ValueError:
+        logger.warning("Invalid integer for %s; using default %s", name, default)
+        return default
+
+
+def env_csv(name: str, default: str) -> List[str]:
+    raw = os.getenv(name, default)
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
+
+load_local_env()
+
+# --- Configuration ---
+API_HOST = os.getenv("API_HOST", "0.0.0.0")
+API_PORT = env_int("API_PORT", 8000)
+FRONTEND_ORIGINS = env_csv("FRONTEND_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173")
+
+KAFKA_SERVERS = env_csv("KAFKA_BOOTSTRAP_SERVERS", "10.204.131.11:9092,10.84.128.10:9092")
+KAFKA_TOPIC_PLAY = os.getenv("KAFKA_TOPIC_PLAY", "music.events.play")
+KAFKA_TOPIC_SKIP = os.getenv("KAFKA_TOPIC_SKIP", "music.events.skip")
+KAFKA_TOPIC_LIKE = os.getenv("KAFKA_TOPIC_LIKE", "music.events.like")
+KAFKA_AUTO_OFFSET_RESET = os.getenv("KAFKA_AUTO_OFFSET_RESET", "latest")
+KAFKA_CREATE_TOPICS = env_bool("KAFKA_CREATE_TOPICS", False)
+KAFKA_START_WS_CONSUMER = env_bool("KAFKA_START_WS_CONSUMER", True)
+KAFKA_LOCAL_FORWARD_ENABLED = env_bool("KAFKA_LOCAL_FORWARD_ENABLED", False)
+KAFKA_LOCAL_FORWARD_BIND = os.getenv("KAFKA_LOCAL_FORWARD_BIND", "127.0.0.1:9092")
+KAFKA_LOCAL_FORWARD_TARGET = os.getenv("KAFKA_LOCAL_FORWARD_TARGET", "10.204.131.11:9092")
+KAFKA_LOCAL_FORWARD_REQUIRED = env_bool("KAFKA_LOCAL_FORWARD_REQUIRED", True)
+KAFKA_LOCAL_FORWARD_READY_TIMEOUT_SECONDS = env_int("KAFKA_LOCAL_FORWARD_READY_TIMEOUT_SECONDS", 10)
+
+HIVE_SERVER2_IP = os.getenv("HIVE_SERVER2_IP", "10.84.128.48")
+HIVE_SERVER2_PORT = env_int("HIVE_SERVER2_PORT", 10000)
+HIVE_DATABASE = os.getenv("HIVE_DATABASE", "francisco_jose_simoes")
+HIVE_USERNAME = os.getenv("HIVE_USERNAME", "g3")
+
+REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
+REDIS_PORT = env_int("REDIS_PORT", 6379)
+APP_CACHE_ENABLED = env_bool("APP_CACHE_ENABLED", False)
+ENABLE_NOTIFICATION_POLL = env_bool("ENABLE_NOTIFICATION_POLL", False)
+
+
+def split_host_port(value: str) -> tuple[str, int]:
+    host, port = value.rsplit(":", 1)
+    return host, int(port)
+
+
+def is_tcp_open(host: str, port: int, timeout_seconds: float = 0.5) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=timeout_seconds):
+            return True
+    except OSError:
+        return False
+
+
+def wait_for_tcp(host: str, port: int, timeout_seconds: int) -> bool:
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        if is_tcp_open(host, port):
+            return True
+        time.sleep(0.25)
+    return is_tcp_open(host, port)
+
+
+def maybe_start_kafka_local_forward() -> bool:
+    if not KAFKA_LOCAL_FORWARD_ENABLED:
+        return True
+
+    try:
+        bind_host, bind_port = split_host_port(KAFKA_LOCAL_FORWARD_BIND)
+        target_host, target_port = split_host_port(KAFKA_LOCAL_FORWARD_TARGET)
+    except ValueError:
+        logger.warning(
+            "Invalid Kafka local forward config: bind=%s target=%s",
+            KAFKA_LOCAL_FORWARD_BIND,
+            KAFKA_LOCAL_FORWARD_TARGET,
+        )
+        return False
+
+    if is_tcp_open(bind_host, bind_port):
+        logger.info("Kafka local forward already available at %s", KAFKA_LOCAL_FORWARD_BIND)
+        return True
+
+    command = [
+        "socat",
+        f"TCP4-LISTEN:{bind_port},bind={bind_host},reuseaddr,fork",
+        f"TCP4:{target_host}:{target_port}",
+    ]
+    try:
+        subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if wait_for_tcp(bind_host, bind_port, KAFKA_LOCAL_FORWARD_READY_TIMEOUT_SECONDS):
+            logger.info(
+                "Started Kafka local forward %s -> %s",
+                KAFKA_LOCAL_FORWARD_BIND,
+                KAFKA_LOCAL_FORWARD_TARGET,
+            )
+            return True
+        else:
+            logger.error(
+                "Kafka local forward did not become ready at %s within %s seconds",
+                KAFKA_LOCAL_FORWARD_BIND,
+                KAFKA_LOCAL_FORWARD_READY_TIMEOUT_SECONDS,
+            )
+            return False
+    except FileNotFoundError:
+        logger.error("KAFKA_LOCAL_FORWARD_ENABLED=true but socat is not installed in this environment.")
+        return False
+    except Exception as e:
+        logger.error("Failed to start Kafka local forward: %s", e)
+        return False
+
+
+if not maybe_start_kafka_local_forward() and KAFKA_LOCAL_FORWARD_REQUIRED:
+    raise RuntimeError(
+        "Kafka local forward is required but unavailable. "
+        "Install socat or set KAFKA_LOCAL_FORWARD_REQUIRED=false."
+    )
 
 # --- WebSocket Manager ---
 class ConnectionManager:
@@ -50,7 +199,7 @@ def kafka_worker(loop, servers, topic):
             bootstrap_servers=servers,
             value_deserializer=lambda v: json.loads(v.decode('utf-8')),
             api_version=(0, 10, 1),
-            auto_offset_reset='latest'   # ← era 'earliest', volta para 'latest'
+            auto_offset_reset=KAFKA_AUTO_OFFSET_RESET
         )
         for message in consumer:
             data = message.value
@@ -95,29 +244,16 @@ async def log_requests(request, call_next):
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=FRONTEND_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# --- Configuration ---
-KAFKA_SERVERS        = ["10.204.131.11:9092", "10.84.128.10:9092"]
-KAFKA_TOPIC_PLAY     = "music.events.play"
-KAFKA_TOPIC_SKIP     = "music.events.skip"
-KAFKA_TOPIC_LIKE     = "music.events.like"
-HIVE_SERVER2_IP      = os.getenv("HIVE_SERVER2_IP", "10.84.128.48")
-HIVE_SERVER2_PORT    = int(os.getenv("HIVE_SERVER2_PORT", 10000))
-HIVE_DATABASE        = os.getenv("HIVE_DATABASE", "francisco_jose_simoes")
-REDIS_HOST           = os.getenv("REDIS_HOST", "localhost")
-REDIS_PORT           = int(os.getenv("REDIS_PORT", 6379))
-ENABLE_NOTIFICATION_POLL = os.getenv("ENABLE_NOTIFICATION_POLL", "false").lower() == "true"
-APP_CACHE_ENABLED = os.getenv("APP_CACHE_ENABLED", "false").lower() == "true"
-
 # --- Kafka: ensure topics exist ---
 KAFKA_TOPICS = [KAFKA_TOPIC_PLAY, KAFKA_TOPIC_SKIP, KAFKA_TOPIC_LIKE]
 
-if KAFKA_AVAILABLE:
+if KAFKA_AVAILABLE and KAFKA_CREATE_TOPICS:
     try:
         admin = KafkaAdminClient(bootstrap_servers=KAFKA_SERVERS, api_version=(0, 10, 1))
         existing = admin.list_topics()
@@ -128,6 +264,8 @@ if KAFKA_AVAILABLE:
         admin.close()
     except Exception as e:
         logger.warning(f"Kafka Admin Error: {e}")
+elif KAFKA_AVAILABLE:
+    logger.info("Kafka topic creation disabled. Set KAFKA_CREATE_TOPICS=true to enable it.")
 
 # --- Kafka Producer ---
 producer = None
@@ -165,7 +303,7 @@ def hive_conn():
     return hive.Connection(
         host=HIVE_SERVER2_IP,
         port=HIVE_SERVER2_PORT,
-        username='hadoop',
+        username=HIVE_USERNAME,
         database=HIVE_DATABASE
     )
 
@@ -620,6 +758,10 @@ def send_kafka_event(topic: str, data: dict):
         logger.warning(f"Kafka Producer NOT AVAILABLE. Event not sent to {topic}.")
 
 
+def new_event_id(event_type: str, user_id: int, recording_id: int) -> str:
+    return f"{event_type}:{user_id}:{recording_id}:{uuid.uuid4().hex}"
+
+
 def get_artist_songs(artist_id: int, n: int = 10) -> List[dict]:
     cache_key = f"artist:{artist_id}:songs"
     if APP_CACHE_ENABLED and r_cache:
@@ -950,6 +1092,8 @@ def home_feed(user_id: int, n: int = 8):
 @app.post("/event/play")
 def record_play(event: PlayEvent):
     send_kafka_event(KAFKA_TOPIC_PLAY, {
+        "event_id": new_event_id("play", event.user_id, event.recording_id),
+        "event_type": "play",
         "user_id": event.user_id,
         "recording_id": event.recording_id,
         "ts": time.time(),
@@ -964,6 +1108,8 @@ def record_play(event: PlayEvent):
 @app.post("/event/skip")
 def record_skip(event: SkipEvent):
     send_kafka_event(KAFKA_TOPIC_SKIP, {
+        "event_id": new_event_id("skip", event.user_id, event.recording_id),
+        "event_type": "skip",
         "user_id": event.user_id,
         "recording_id": event.recording_id,
         "ts": time.time(),
@@ -975,6 +1121,8 @@ def record_skip(event: SkipEvent):
 @app.post("/event/like")
 def record_like(event: LikeEvent):
     send_kafka_event(KAFKA_TOPIC_LIKE, {
+        "event_id": new_event_id("like", event.user_id, event.recording_id),
+        "event_type": "like",
         "user_id": event.user_id,
         "recording_id": event.recording_id,
         "ts": time.time(),
@@ -1017,6 +1165,8 @@ async def broadcast_random_song():
         for user in users:
             song = assignments[user.id]
             send_kafka_event(KAFKA_TOPIC_PLAY, {
+                "event_id": new_event_id("play", user.id, song["id"]),
+                "event_type": "play",
                 "user_id": user.id,
                 "recording_id": song["id"],
                 "ts": time.time(),
@@ -1086,7 +1236,7 @@ async def websocket_endpoint(websocket: WebSocket):
 
 @app.on_event("startup")
 async def startup_event():
-    if KAFKA_AVAILABLE:
+    if KAFKA_AVAILABLE and KAFKA_START_WS_CONSUMER:
         loop = asyncio.get_running_loop()
         thread = threading.Thread(
             target=kafka_worker,
@@ -1094,6 +1244,8 @@ async def startup_event():
             daemon=True
         )
         thread.start()
+    elif KAFKA_AVAILABLE:
+        logger.info("Kafka WebSocket consumer disabled. Set KAFKA_START_WS_CONSUMER=true to enable it.")
     if ENABLE_NOTIFICATION_POLL:
         asyncio.create_task(poll_notifications(asyncio.get_running_loop()))
     else:
@@ -1112,4 +1264,4 @@ async def simulate_notification(user_id: int, artist_name: str = "Radiohead", re
     
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host=API_HOST, port=API_PORT)

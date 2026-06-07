@@ -78,7 +78,8 @@ docker run -d ^
   -e FEAT_PATH=/home/hadoop/data/mbdump_small/features/implicit.tsv ^
   -e FEATURE_DIR=/home/hadoop/data/mbdump_small/features ^
   -e MODEL_DIR=/home/hadoop/data/mbdump_small/models ^
-  -e SPARK_CHECKPOINT_PATH=/home/hadoop/data/mbdump_small/checkpoints/music_stream ^
+  -e SPARK_CHECKPOINT_LOCATION=/home/hadoop/data/mbdump_small/checkpoints/music_events_play_v2 ^
+  -e SPARK_CHECKPOINT_PATH=/home/hadoop/data/mbdump_small/checkpoints/music_events_play_v2 ^
   --mount src="%CD%",dst=/home/hadoop/data/,type=bind ^
   %IMAGE%
 

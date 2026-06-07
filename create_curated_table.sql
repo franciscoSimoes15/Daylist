@@ -29,7 +29,7 @@ CREATE TABLE curated_friends STORED AS ORC AS SELECT CAST(user_id AS BIGINT) AS 
 
 CREATE TABLE curated_fav_artists STORED AS ORC AS SELECT CAST(user_id AS BIGINT) AS user_id, CAST(artist_id AS BIGINT) AS artist_id FROM raw_fav_artists;
 
-CREATE TABLE curated_history STORED AS ORC AS SELECT CAST(user_id AS BIGINT) AS user_id, CAST(recording_id AS BIGINT) AS recording_id, `timestamp`, time_of_day, CAST(duration_ms AS BIGINT) AS duration_ms, CAST(completed AS BOOLEAN) AS completed FROM raw_history WHERE user_id IS NOT NULL AND recording_id IS NOT NULL;
+CREATE TABLE curated_history STORED AS ORC AS SELECT CAST(user_id AS BIGINT) AS user_id, CAST(recording_id AS BIGINT) AS recording_id, `timestamp`, time_of_day, CAST(duration_ms AS BIGINT) AS duration_ms, CAST(completed AS BOOLEAN) AS completed, CAST(NULL AS STRING) AS event_id FROM raw_history WHERE user_id IS NOT NULL AND recording_id IS NOT NULL;
 
 CREATE TABLE curated_streaming_events STORED AS ORC AS SELECT event_type, CAST(user_id AS BIGINT) AS user_id, CAST(recording_id AS BIGINT) AS recording_id, ts, CAST(duration_ms AS BIGINT) AS duration_ms, CAST(position_ms AS BIGINT) AS position_ms FROM raw_streaming_events;
 

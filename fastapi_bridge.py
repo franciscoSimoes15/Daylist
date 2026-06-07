@@ -57,7 +57,7 @@ def env_csv(name: str, default: str) -> List[str]:
 
 load_local_env()
 
-# --- Configuration ---
+# Runtime configuration is loaded from .env first, then overridden by container env vars.
 API_HOST = os.getenv("API_HOST", "0.0.0.0")
 API_PORT = env_int("API_PORT", 8000)
 FRONTEND_ORIGINS = env_csv("FRONTEND_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173")
@@ -166,7 +166,7 @@ if not maybe_start_kafka_local_forward() and KAFKA_LOCAL_FORWARD_REQUIRED:
         "Install socat or set KAFKA_LOCAL_FORWARD_REQUIRED=false."
     )
 
-# --- WebSocket Manager ---
+# Tracks connected browser clients for real-time playback and notification updates.
 class ConnectionManager:
     def __init__(self):
         self.active_connections: List[WebSocket] = []
@@ -193,7 +193,7 @@ class ConnectionManager:
 
 manager = ConnectionManager()
 
-# --- Kafka Consumer Thread ---
+# Background Kafka consumer used only for WebSocket fan-out to the frontend.
 def kafka_worker(loop, servers, topics):
     try:
         from kafka import KafkaConsumer
@@ -253,7 +253,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- Kafka: ensure topics exist ---
+# Topic creation is optional because school-managed Kafka topics may be read-only.
 KAFKA_TOPICS = [KAFKA_TOPIC_PLAY, KAFKA_TOPIC_SKIP, KAFKA_TOPIC_LIKE]
 
 if KAFKA_AVAILABLE and KAFKA_CREATE_TOPICS:
@@ -270,7 +270,7 @@ if KAFKA_AVAILABLE and KAFKA_CREATE_TOPICS:
 elif KAFKA_AVAILABLE:
     logger.info("Kafka topic creation disabled. Set KAFKA_CREATE_TOPICS=true to enable it.")
 
-# --- Kafka Producer ---
+# Shared producer for frontend interaction events.
 producer = None
 if KAFKA_AVAILABLE:
     try:
@@ -286,7 +286,7 @@ if KAFKA_AVAILABLE:
 else:
     logger.error("kafka-python NOT INSTALLED.")
 
-# --- Redis ---
+# Redis is the speed layer for recommendations and playback queues.
 r_cache = None
 if REDIS_AVAILABLE:
     for host in [REDIS_HOST, "host.docker.internal"]:
@@ -301,7 +301,7 @@ if REDIS_AVAILABLE:
 if not r_cache:
     logger.warning("Redis not available. Caching disabled.")
 
-# --- Hive helper ---
+# HiveServer2 connection for batch serving queries.
 def hive_conn():
     return hive.Connection(
         host=HIVE_SERVER2_IP,
@@ -310,11 +310,7 @@ def hive_conn():
         database=HIVE_DATABASE
     )
 
-# NOTE: correct artist JOIN path in MusicBrainz schema:
-# curated_recording.artist_credit
-#   → curated_artist_credit_name.artist_credit (intermediary)
-#   → curated_artist_credit_name.artist
-#   → curated_artist.id
+# MusicBrainz stores recording artists through artist-credit names.
 ARTIST_JOIN = """
     JOIN curated_artist_credit_name acn ON r.artist_credit = acn.artist_credit
     JOIN curated_artist a ON acn.artist = a.id
@@ -352,7 +348,7 @@ def merge_song_artist_rows(rows, has_score: bool = False, limit: Optional[int] =
 
     return songs[:limit] if limit else songs
 
-# --- Pydantic Models ---
+# API response and request schemas.
 class PlayEvent(BaseModel):
     user_id: int
     recording_id: int
@@ -417,9 +413,7 @@ class SearchResponse(BaseModel):
     query: str
     results: List[SongInfoWithScore]
 
-# ============================================================
-# LOGIC
-# ============================================================
+# Serving logic
 
 FALLBACK_USERNAMES = {"guest", "mockuser", "manual"}
 
@@ -482,7 +476,7 @@ def get_hive_users(n: int = 20, use_cache: bool = True) -> List[UserProfile]:
 def get_batch_recommendations(user_id: int, n: int = 8) -> dict:
     cache_key = f"recs:{user_id}"
 
-    # 1. Redis (speed layer — ML recs from Spark Streaming)
+    # Prefer Spark-updated Redis recommendations for low-latency playback.
     if r_cache:
         cached = r_cache.get(cache_key)
         if cached:
@@ -496,7 +490,7 @@ def get_batch_recommendations(user_id: int, n: int = 8) -> dict:
         conn = hive_conn()
         cursor = conn.cursor()
 
-        # 2. Hive batch layer — top played songs for this user
+        # Fallback to Hive batch history when no live cache is available.
         cursor.execute(f"""
             SELECT r.id, r.name, a.name
             FROM curated_history h
@@ -509,7 +503,7 @@ def get_batch_recommendations(user_id: int, n: int = 8) -> dict:
         """)
         songs = merge_song_artist_rows(cursor.fetchall(), limit=n)
 
-        # 3. Cold start — user has no history
+        # Cold-start users receive a small catalog sample.
         if not songs:
             logger.info(f"Cold start: user {user_id}, serving popular songs")
             cursor.execute(f"""
@@ -686,13 +680,13 @@ def search_tracks(query: str, n: int = 20) -> List[dict]:
     if not HIVE_AVAILABLE:
         return []
 
-    q = query.lower().strip().replace("'", "''")  # sanitise
+    q = query.lower().strip().replace("'", "''")  # Escape single quotes for Hive string literals.
 
     try:
         conn = hive_conn()
         cursor = conn.cursor()
 
-        # Search by track name (exact + partial) and artist name
+        # Rank direct recording and artist-name matches before tag matches.
         cursor.execute(f"""
             SELECT
                 r.id,
@@ -717,7 +711,7 @@ def search_tracks(query: str, n: int = 20) -> List[dict]:
         """)
         results = merge_song_artist_rows(cursor.fetchall(), has_score=True, limit=n)
 
-        # Enrich with tag matches if results < n
+        # Add tag matches only when direct search returns too few rows.
         if len(results) < n:
             existing_ids = {r["id"] for r in results}
             cursor.execute(f"""
@@ -938,7 +932,7 @@ def set_user_queue(user_id: int, songs: List[dict]):
     pipe.delete(queue_key)
     for song in songs[:10]:
         pipe.rpush(queue_key, json.dumps(song))
-    pipe.expire(queue_key, 3600)  # expira em 1h
+    pipe.expire(queue_key, 3600)
     pipe.execute()
 
 def pop_next_from_queue(user_id: int) -> Optional[dict]:
@@ -980,9 +974,7 @@ def get_user_history_home(user_id: int, n: int = 8) -> List[dict]:
     except Exception as e:
         logger.error(f"Home history fetch failed: {e}")
         return []
-# ============================================================
-# ROUTES
-# ============================================================
+# HTTP and WebSocket routes
 
 @app.get("/health")
 def health():
@@ -997,13 +989,13 @@ def health():
 def list_users(use_cache: bool = False):
     return get_hive_users(use_cache=use_cache)
 
-# --- Recommendations ---
+# Recommendations
 @app.get("/recommend/{user_id}", response_model=RecommendationResponse)
 def get_recommendations(user_id: int, n: int = 8):
     result = get_batch_recommendations(user_id, n)
     return RecommendationResponse(**result)
 
-# --- Playlist by time of day ---
+# Playlist by time of day
 @app.get("/playlist/{user_id}", response_model=PlaylistResponse)
 def get_playlist(user_id: int, time_of_day: str = "morning", n: int = 10):
     valid = {"morning", "afternoon", "night"}
@@ -1013,18 +1005,18 @@ def get_playlist(user_id: int, time_of_day: str = "morning", n: int = 10):
     return PlaylistResponse(user_id=user_id, time_of_day=time_of_day,
                             songs=[SongInfoWithScore(**s) for s in songs])
 
-# --- Friend history ---
+# Friend activity
 @app.get("/friends/{user_id}/history", response_model=List[SongInfoWithScore])
 def friend_history(user_id: int, n: int = 20):
     songs = get_friend_history(user_id, n)
     return [SongInfoWithScore(**s) for s in songs]
 
-# --- Friend list ---
+# Friend list
 @app.get("/friends/{user_id}/list", response_model=List[UserProfile])
 def list_friends(user_id: int):
     return get_user_friends(user_id)
 
-# --- Notifications ---
+# Artist notifications
 @app.get("/notifications/{user_id}", response_model=List[NotificationItem])
 def notifications(user_id: int):
     notifs = get_notifications(user_id)
@@ -1052,7 +1044,7 @@ def recording_album(recording_id: int):
         raise HTTPException(status_code=404, detail="Album not found for recording")
     return RecordingAlbumResponse(**album)
 
-# --- Semantic Search ---
+# Search
 @app.get("/search", response_model=SearchResponse)
 def search(q: str, n: int = 20):
     if not q or len(q.strip()) < 2:
@@ -1060,7 +1052,7 @@ def search(q: str, n: int = 20):
     results = search_tracks(q, n)
     return SearchResponse(query=q, results=[SongInfoWithScore(**r) for r in results])
 
-# Fallback for common frontend typo
+# Backward-compatible fallback for an older frontend search route.
 @app.get("/searchq={q}")
 def search_fallback(q: str, n: int = 20):
     logger.warning(f"Fallback search triggered for: {q}")
@@ -1091,7 +1083,7 @@ def next_in_queue(user_id: int):
 def home_feed(user_id: int, n: int = 8):
     return get_batch_recommendations(user_id, n)
 
-# --- Events → Kafka ---
+# Frontend interaction events are appended to Kafka and processed asynchronously.
 @app.post("/event/play")
 def record_play(event: PlayEvent):
     send_kafka_event(KAFKA_TOPIC_PLAY, {
@@ -1103,7 +1095,6 @@ def record_play(event: PlayEvent):
         "duration_ms": event.duration_ms,
         "source": "frontend"
     })
-    # Invalida cache home para forçar refresh na próxima visita
     if r_cache:
         r_cache.delete(f"home:{event.user_id}")
     return {"status": "event_recorded", "topic": KAFKA_TOPIC_PLAY}
@@ -1162,7 +1153,7 @@ async def broadcast_random_song():
 
         users = get_hive_users()
 
-        # Música diferente para cada user
+        # Broadcast assigns one song per active demo user.
         assignments = {user.id: random.choice(pool) for user in users}
 
         for user in users:
@@ -1193,7 +1184,7 @@ async def broadcast_random_song():
 
 async def poll_notifications(loop):
     """Verifica de 30 em 30s se há novas notificações para algum user."""
-    await asyncio.sleep(15)  # espera inicial
+    await asyncio.sleep(15)
     while True:
         try:
             if not manager.active_connections:
@@ -1208,7 +1199,6 @@ async def poll_notifications(loop):
                 if old_cached:
                     old_ids = {n["release_id"] for n in json.loads(old_cached)}
                 
-                # Invalida cache para forçar re-fetch
                 if r_cache:
                     r_cache.delete(cache_key)
                 
@@ -1225,9 +1215,9 @@ async def poll_notifications(loop):
         except Exception as e:
             logger.error(f"Notification poll failed: {e}")
         
-        await asyncio.sleep(30)  # verifica a cada 30s        
+        await asyncio.sleep(30)
 
-# --- WebSocket ---
+# WebSocket endpoint used by the React client.
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await manager.connect(websocket)

@@ -48,7 +48,7 @@ def env_bool(name: str, default: bool = False) -> bool:
 
 load_local_env()
 
-# --- Config ---
+# Runtime configuration for Kafka, Redis, Hive, and checkpointing.
 KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "10.204.131.11:9092")
 KAFKA_TOPIC_PLAY = os.getenv("KAFKA_TOPIC_PLAY", "music.events.play")
 KAFKA_TOPIC_SKIP = os.getenv("KAFKA_TOPIC_SKIP", "music.events.skip")
@@ -73,16 +73,16 @@ SPARK_CHECKPOINT_LOCATION = os.getenv(
 )
 SPARK_CHECKPOINT_AUTOVERSION = env_bool("SPARK_CHECKPOINT_AUTOVERSION", True)
 
-# --- Global Brain State ---
+# In-memory recommendation state loaded from the offline ALS model.
 BRAIN = {
     "time":         0,
     "model":        None,
     "u_enc":        None,
-    "r_enc":        None,   # FIX: was missing in original
+    "r_enc":        None,
     "r_dec":        None,
     "matrix":       None,
-    "live_deltas":  {},     # PERF: avoids CSR→LIL→CSR rebuild on every event
-    "suppressed":   set()   # (user_idx, recording_idx) pairs skipped by the user
+    "live_deltas":  {},
+    "suppressed":   set()
 }
 MODEL_PATH = os.getenv("MODEL_PATH", "./mbdump_small/models/als_model.pkl")
 FEAT_PATH = os.getenv("FEATURE_PATH", os.getenv("FEAT_PATH", "./mbdump_small/features/implicit.tsv"))
@@ -164,7 +164,7 @@ def maybe_start_kafka_local_forward() -> bool:
 def update_brain():
     if not os.path.exists(MODEL_PATH): return False
     mtime = os.path.getmtime(MODEL_PATH)
-    if mtime <= BRAIN["time"]: return True  # unchanged
+    if mtime <= BRAIN["time"]: return True
 
     print("\n*** NEW BRAIN DETECTED! Loading... ***")
     try:
@@ -181,7 +181,7 @@ def update_brain():
         BRAIN["u_enc"]       = data['user_enc']
         BRAIN["r_enc"]       = data['rec_enc']
         BRAIN["r_dec"]       = data['rec_dec']
-        BRAIN["live_deltas"] = {}   # reset — new matrix already contains latest history
+        BRAIN["live_deltas"] = {}
         BRAIN["suppressed"]  = set()
         BRAIN["time"]        = mtime
         print("*** BRAIN LOAD SUCCESS! ***\n")
@@ -192,12 +192,12 @@ def update_brain():
 
 
 def get_user_row(u_idx):
-    """Return user's interaction row with live deltas applied."""
-    row = BRAIN["matrix"][u_idx].tolil()  # LIL is fast for edit
+    """Return a model input row with this process's live feedback applied."""
+    row = BRAIN["matrix"][u_idx].tolil()
     for (ui, ri), val in BRAIN["live_deltas"].items():
         if ui == u_idx:
             row[0, ri] += val
-    return row.tocsr()  # CSR needed for brain
+    return row.tocsr()
 
 
 def event_weight(event_type: str, duration_ms, position_ms) -> float:
@@ -245,7 +245,6 @@ def main():
     print(f"Spark checkpoint base: {SPARK_CHECKPOINT_LOCATION}")
     print(f"Spark checkpoint effective: {checkpoint_location}")
 
-    # In spark_streaming.py, replace SparkSession builder:
     spark = SparkSession.builder.appName("Caveman-Speed-Layer") \
         .config("spark.jars.packages", "org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1") \
         .config("mapreduce.fileoutputcommitter.algorithm.version", "2") \
@@ -257,7 +256,7 @@ def main():
         print("CRITICAL: No brain found. Run train_spark_model.py!")
         return
 
-    # PERF: single Redis connection for the lifetime of the stream
+    # Keep one Redis client and reconnect only when the connection is lost.
     redis_client = connect_redis()
 
     schema = StructType([
@@ -325,12 +324,7 @@ def main():
 
         print(f"\n[Batch {batch_id}] Events = {batch_df.count()}")
 
-        # --- 1. Write raw stream events and play history to Hive ---
-        # FIX: insertInto() instead of saveAsTable(mode=append).
-        # saveAsTable issues a CTAS on every batch — on batch 2+ it tries to
-        # re-create the table, the _temporary dir from the previous batch is
-        # already gone, and HDFS throws FileNotFoundException during commit.
-        # insertInto() issues a plain INSERT INTO on the existing table.
+        # Write all interaction events to the event table; only plays become listening history.
         try:
             streaming_events_df = batch_df \
                 .dropDuplicates(["event_id"]) \
@@ -383,7 +377,7 @@ def main():
         except Exception as e:
             print(f" -> Hive write error: {e}")
 
-        # --- 2. Reconnect Redis if needed ---
+        # Refresh Redis connection before publishing live recommendations.
         try:
             redis_client.ping()
         except Exception:
@@ -391,11 +385,10 @@ def main():
             redis_client = connect_redis()
         if not redis_client: return
 
-        # --- 3. Compute recommendations for all users in this batch ---
+        # Compute live recommendations for users seen in this micro-batch.
         pdf = batch_df.toPandas()
 
-        # PERF: collect all rec IDs in one pass, then do a single Hive metadata query
-        user_recs   = {}   # uid -> [recording_id, ...]
+        user_recs   = {}
         all_rec_ids = set()
 
         for _, row in pdf.iterrows():
@@ -410,7 +403,6 @@ def main():
 
             u_idx = BRAIN["u_enc"][uid]
 
-            # PERF: record delta instead of rebuilding the full matrix
             if rid in BRAIN["r_enc"]:
                 r_idx = BRAIN["r_enc"][rid]
                 key = (u_idx, r_idx)
@@ -439,7 +431,7 @@ def main():
 
         if not user_recs: return
 
-        # --- 4. PERF: single Hive connection for all metadata in this batch ---
+        # Resolve song metadata once per batch for every recommended recording.
         song_dict = {}
         if all_rec_ids:
             try:
@@ -462,7 +454,7 @@ def main():
             except Exception as e:
                 print(f" -> Hive metadata fetch failed: {e}")
 
-        # --- 5. Push fresh recs to Redis ---
+        # Publish updated recommendation lists for FastAPI to serve.
         for uid, live_recs in user_recs.items():
             real_songs = [
                 {

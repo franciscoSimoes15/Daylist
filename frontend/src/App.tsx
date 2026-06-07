@@ -580,7 +580,7 @@ const playNext = async () => {
         <div className="w-64 bg-black flex flex-col pt-6 pb-2 px-4 h-full border-r border-gray-800 hidden md:flex">
         <div className="flex items-center mb-8 px-2 text-white font-bold text-xl tracking-tight">
           <Disc3 className="text-green-500 mr-3 h-8 w-8" /> 
-          BigData Music
+          Daylist
         </div>
         
         <div className="space-y-4 flex-grow">

@@ -50,7 +50,10 @@ load_local_env()
 
 # --- Config ---
 KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "10.204.131.11:9092")
-KAFKA_TOPIC = os.getenv("KAFKA_TOPIC_PLAY", os.getenv("KAFKA_TOPIC", "music.events.play"))
+KAFKA_TOPIC_PLAY = os.getenv("KAFKA_TOPIC_PLAY", "music.events.play")
+KAFKA_TOPIC_SKIP = os.getenv("KAFKA_TOPIC_SKIP", "music.events.skip")
+KAFKA_TOPIC_LIKE = os.getenv("KAFKA_TOPIC_LIKE", "music.events.like")
+KAFKA_TOPICS = os.getenv("KAFKA_TOPICS", ",".join([KAFKA_TOPIC_PLAY, KAFKA_TOPIC_SKIP, KAFKA_TOPIC_LIKE]))
 KAFKA_STARTING_OFFSETS = os.getenv("KAFKA_STARTING_OFFSETS", "latest")
 KAFKA_FAIL_ON_DATA_LOSS = os.getenv("KAFKA_FAIL_ON_DATA_LOSS", "true").lower()
 KAFKA_LOCAL_FORWARD_ENABLED = env_bool("KAFKA_LOCAL_FORWARD_ENABLED", False)
@@ -78,7 +81,8 @@ BRAIN = {
     "r_enc":        None,   # FIX: was missing in original
     "r_dec":        None,
     "matrix":       None,
-    "live_deltas":  {}      # PERF: avoids CSR→LIL→CSR rebuild on every event
+    "live_deltas":  {},     # PERF: avoids CSR→LIL→CSR rebuild on every event
+    "suppressed":   set()   # (user_idx, recording_idx) pairs skipped by the user
 }
 MODEL_PATH = os.getenv("MODEL_PATH", "./mbdump_small/models/als_model.pkl")
 FEAT_PATH = os.getenv("FEATURE_PATH", os.getenv("FEAT_PATH", "./mbdump_small/features/implicit.tsv"))
@@ -88,7 +92,7 @@ def effective_checkpoint_location() -> str:
     if not SPARK_CHECKPOINT_AUTOVERSION:
         return SPARK_CHECKPOINT_LOCATION
 
-    topic_slug = quote(KAFKA_TOPIC.replace(".", "_"), safe="_-")
+    topic_slug = quote(KAFKA_TOPICS.replace(".", "_").replace(",", "__"), safe="_-")
     if SPARK_CHECKPOINT_LOCATION.rstrip("/").endswith(topic_slug):
         return SPARK_CHECKPOINT_LOCATION
     return f"{SPARK_CHECKPOINT_LOCATION.rstrip('/')}/{topic_slug}"
@@ -178,6 +182,7 @@ def update_brain():
         BRAIN["r_enc"]       = data['rec_enc']
         BRAIN["r_dec"]       = data['rec_dec']
         BRAIN["live_deltas"] = {}   # reset — new matrix already contains latest history
+        BRAIN["suppressed"]  = set()
         BRAIN["time"]        = mtime
         print("*** BRAIN LOAD SUCCESS! ***\n")
         return True
@@ -193,6 +198,21 @@ def get_user_row(u_idx):
         if ui == u_idx:
             row[0, ri] += val
     return row.tocsr()  # CSR needed for brain
+
+
+def event_weight(event_type: str, duration_ms, position_ms) -> float:
+    """Convert frontend feedback into an implicit-feedback strength."""
+    event_type = (event_type or "").lower()
+    duration = int(duration_ms) if pd.notna(duration_ms) else 0
+    position = int(position_ms) if pd.notna(position_ms) else 0
+
+    if event_type == "like":
+        return 5.0
+    if event_type == "skip":
+        return -3.0 if position < 30000 else -1.0
+    if event_type == "play":
+        return 3.0 if duration > 120000 else 1.0
+    return 0.0
 
 
 def connect_redis():
@@ -219,7 +239,7 @@ def main():
 
     print("=== Spark Streaming Config ===")
     print(f"Kafka bootstrap servers: {KAFKA_BOOTSTRAP_SERVERS}")
-    print(f"Kafka subscribed topic: {KAFKA_TOPIC}")
+    print(f"Kafka subscribed topics: {KAFKA_TOPICS}")
     print(f"Kafka starting offsets: {KAFKA_STARTING_OFFSETS}")
     print(f"Kafka failOnDataLoss: {KAFKA_FAIL_ON_DATA_LOSS}")
     print(f"Spark checkpoint base: {SPARK_CHECKPOINT_LOCATION}")
@@ -247,12 +267,13 @@ def main():
         StructField("recording_id", IntegerType()),
         StructField("ts",           DoubleType()),
         StructField("duration_ms",  IntegerType()),
+        StructField("position_ms",  IntegerType()),
         StructField("source",       StringType()),
     ])
 
     df_kafka = spark.readStream.format("kafka") \
         .option("kafka.bootstrap.servers", KAFKA_BOOTSTRAP_SERVERS) \
-        .option("subscribe", KAFKA_TOPIC) \
+        .option("subscribe", KAFKA_TOPICS) \
         .option("startingOffsets", KAFKA_STARTING_OFFSETS) \
         .option("failOnDataLoss", KAFKA_FAIL_ON_DATA_LOSS) \
         .load()
@@ -271,13 +292,29 @@ def main():
                 col("event_id"),
                 concat_ws(":", col("kafka_topic"), col("kafka_partition").cast("string"), col("kafka_offset").cast("string")),
             ),
+        ) \
+        .withColumn(
+            "event_type",
+            coalesce(
+                col("event_type"),
+                when(col("kafka_topic") == KAFKA_TOPIC_PLAY, lit("play"))
+                .when(col("kafka_topic") == KAFKA_TOPIC_SKIP, lit("skip"))
+                .when(col("kafka_topic") == KAFKA_TOPIC_LIKE, lit("like")),
+            ),
         )
 
     history_has_event_id = "event_id" in spark.table(f"{HIVE_DATABASE}.curated_history").columns
+    streaming_events_columns = spark.table(f"{HIVE_DATABASE}.curated_streaming_events").columns
+    streaming_events_has_event_id = "event_id" in streaming_events_columns
     if not history_has_event_id:
         print(
             f"WARNING: {HIVE_DATABASE}.curated_history has no event_id column. "
             "Live writes cannot be idempotent until the Hive migration is applied."
+        )
+    if not streaming_events_has_event_id:
+        print(
+            f"WARNING: {HIVE_DATABASE}.curated_streaming_events has no event_id column. "
+            "Raw streaming-event writes cannot be idempotent until the Hive migration is applied."
         )
 
     def process_batch(batch_df, batch_id):
@@ -288,18 +325,43 @@ def main():
 
         print(f"\n[Batch {batch_id}] Events = {batch_df.count()}")
 
-        # --- 1. Write events to Hive ---
+        # --- 1. Write raw stream events and play history to Hive ---
         # FIX: insertInto() instead of saveAsTable(mode=append).
         # saveAsTable issues a CTAS on every batch — on batch 2+ it tries to
         # re-create the table, the _temporary dir from the previous batch is
         # already gone, and HDFS throws FileNotFoundException during commit.
         # insertInto() issues a plain INSERT INTO on the existing table.
         try:
-            hive_df = batch_df \
+            streaming_events_df = batch_df \
                 .dropDuplicates(["event_id"]) \
-                .withColumn("timestamp",   from_unixtime(col("ts"))) \
+                .select("event_id", "event_type", "user_id", "recording_id", "ts", "duration_ms", "position_ms")
+
+            if streaming_events_has_event_id:
+                existing_stream_events = spark.table(f"{HIVE_DATABASE}.curated_streaming_events") \
+                    .select("event_id") \
+                    .where(col("event_id").isNotNull()) \
+                    .dropDuplicates(["event_id"])
+                streaming_events_df = streaming_events_df.join(existing_stream_events, on="event_id", how="left_anti") \
+                    .select("event_id", "event_type", "user_id", "recording_id", "ts", "duration_ms", "position_ms")
+                streaming_events_df = streaming_events_df.select(*streaming_events_columns)
+            else:
+                streaming_events_df = streaming_events_df.select(
+                    "event_type", "user_id", "recording_id", "ts", "duration_ms", "position_ms"
+                )
+
+            stream_rows_to_write = streaming_events_df.count()
+            if stream_rows_to_write:
+                streaming_events_df.write.insertInto(f"{HIVE_DATABASE}.curated_streaming_events")
+                print(f" -> Streaming events inserted rows: {stream_rows_to_write}")
+            else:
+                print(" -> Streaming events skipped: all events already existed.")
+
+            hive_df = batch_df \
+                .where(col("event_type") == "play") \
+                .dropDuplicates(["event_id"]) \
+                .withColumn("timestamp", from_unixtime(col("ts"))) \
                 .withColumn("time_of_day", lit("live")) \
-                .withColumn("completed",   when(col("duration_ms") > 120000, True).otherwise(False)) \
+                .withColumn("completed", when(col("duration_ms") > 120000, True).otherwise(False)) \
                 .select("user_id", "recording_id", "timestamp", "time_of_day", "duration_ms", "completed", "event_id")
 
             if history_has_event_id:
@@ -314,10 +376,10 @@ def main():
 
             rows_to_write = hive_df.count()
             if rows_to_write == 0:
-                print(" -> Hive write skipped: all events already existed.")
+                print(" -> History write skipped: no new play events.")
             else:
                 hive_df.write.insertInto(f"{HIVE_DATABASE}.curated_history")
-                print(f" -> Hive write inserted rows: {rows_to_write}")
+                print(f" -> History inserted rows: {rows_to_write}")
         except Exception as e:
             print(f" -> Hive write error: {e}")
 
@@ -338,7 +400,9 @@ def main():
 
         for _, row in pdf.iterrows():
             uid, rid = int(row['user_id']), int(row['recording_id'])
-            print(f" >> User {uid} -> Song {rid}")
+            event_type = str(row.get("event_type") or "")
+            weight = event_weight(event_type, row.get("duration_ms"), row.get("position_ms"))
+            print(f" >> User {uid} -> Song {rid} event={event_type} weight={weight}")
 
             if uid not in BRAIN["u_enc"]:
                 print(f" -> Cold Start: User {uid} not in training data.")
@@ -350,13 +414,26 @@ def main():
             if rid in BRAIN["r_enc"]:
                 r_idx = BRAIN["r_enc"][rid]
                 key = (u_idx, r_idx)
-                BRAIN["live_deltas"][key] = BRAIN["live_deltas"].get(key, 0) + 1.0
-                print(f" -> Delta recorded: [{u_idx}, {r_idx}] total={BRAIN['live_deltas'][key]}")
+                if event_type == "skip":
+                    BRAIN["suppressed"].add(key)
+                    print(f" -> Suppressed skipped song: [{u_idx}, {r_idx}]")
+                elif weight > 0:
+                    BRAIN["live_deltas"][key] = BRAIN["live_deltas"].get(key, 0) + weight
+                    if key in BRAIN["suppressed"]:
+                        BRAIN["suppressed"].remove(key)
+                    print(f" -> Delta recorded: [{u_idx}, {r_idx}] total={BRAIN['live_deltas'][key]}")
             else:
                 print(f" -> Song {rid} not in training vocab, skipping delta.")
 
-            ids, _ = BRAIN["model"].recommend(u_idx, get_user_row(u_idx), N=8)
-            live_recs = [int(BRAIN["r_dec"][i]) for i in ids]
+            ids, _ = BRAIN["model"].recommend(u_idx, get_user_row(u_idx), N=16)
+            live_recs = []
+            for i in ids:
+                rec_idx = int(i)
+                if (u_idx, rec_idx) in BRAIN["suppressed"]:
+                    continue
+                live_recs.append(int(BRAIN["r_dec"][rec_idx]))
+                if len(live_recs) >= 8:
+                    break
             user_recs[uid] = live_recs
             all_rec_ids.update(live_recs)
 

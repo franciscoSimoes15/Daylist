@@ -65,6 +65,7 @@ docker run -d ^
   -e HDFS_NAMENODE_HTTP=http://10.84.129.52:9870 ^
   -e KAFKA_SERVERS=10.204.131.11:9092,10.84.128.10:9092 ^
   -e KAFKA_BOOTSTRAP_SERVERS=10.204.131.11:9092,10.84.128.10:9092 ^
+  -e KAFKA_TOPICS=music.events.play,music.events.skip,music.events.like ^
   -e KAFKA_STRICT_HEALTH=false ^
   -e KAFKA_CREATE_TOPICS=false ^
   -e REDIS_HOST=%REDIS_CONTAINER% ^
@@ -78,8 +79,8 @@ docker run -d ^
   -e FEAT_PATH=/home/hadoop/data/mbdump_small/features/implicit.tsv ^
   -e FEATURE_DIR=/home/hadoop/data/mbdump_small/features ^
   -e MODEL_DIR=/home/hadoop/data/mbdump_small/models ^
-  -e SPARK_CHECKPOINT_LOCATION=/home/hadoop/data/mbdump_small/checkpoints/music_events_play_v2 ^
-  -e SPARK_CHECKPOINT_PATH=/home/hadoop/data/mbdump_small/checkpoints/music_events_play_v2 ^
+  -e SPARK_CHECKPOINT_LOCATION=/home/hadoop/data/mbdump_small/checkpoints/music_events_all_v1 ^
+  -e SPARK_CHECKPOINT_PATH=/home/hadoop/data/mbdump_small/checkpoints/music_events_all_v1 ^
   --mount src="%CD%",dst=/home/hadoop/data/,type=bind ^
   %IMAGE%
 

@@ -66,6 +66,10 @@ KAFKA_SERVERS = env_csv("KAFKA_BOOTSTRAP_SERVERS", "10.204.131.11:9092,10.84.128
 KAFKA_TOPIC_PLAY = os.getenv("KAFKA_TOPIC_PLAY", "music.events.play")
 KAFKA_TOPIC_SKIP = os.getenv("KAFKA_TOPIC_SKIP", "music.events.skip")
 KAFKA_TOPIC_LIKE = os.getenv("KAFKA_TOPIC_LIKE", "music.events.like")
+KAFKA_CONSUMER_TOPICS = env_csv(
+    "KAFKA_TOPICS",
+    ",".join([KAFKA_TOPIC_PLAY, KAFKA_TOPIC_SKIP, KAFKA_TOPIC_LIKE]),
+)
 KAFKA_AUTO_OFFSET_RESET = os.getenv("KAFKA_AUTO_OFFSET_RESET", "latest")
 KAFKA_CREATE_TOPICS = env_bool("KAFKA_CREATE_TOPICS", False)
 KAFKA_START_WS_CONSUMER = env_bool("KAFKA_START_WS_CONSUMER", True)
@@ -190,12 +194,12 @@ class ConnectionManager:
 manager = ConnectionManager()
 
 # --- Kafka Consumer Thread ---
-def kafka_worker(loop, servers, topic):
+def kafka_worker(loop, servers, topics):
     try:
         from kafka import KafkaConsumer
-        logger.info(f"Starting background Kafka Consumer for {topic}...")
+        logger.info(f"Starting background Kafka Consumer for {topics}...")
         consumer = KafkaConsumer(
-            topic,
+            *topics,
             bootstrap_servers=servers,
             value_deserializer=lambda v: json.loads(v.decode('utf-8')),
             api_version=(0, 10, 1),
@@ -203,12 +207,11 @@ def kafka_worker(loop, servers, topic):
         )
         for message in consumer:
             data = message.value
-            logger.info(f"Kafka Worker Received: {data}")
+            logger.info(f"Kafka Worker Received from {message.topic}: {data}")
             asyncio.run_coroutine_threadsafe(
-                manager.broadcast({"type": "kafka_event", "data": data}),  # ← tipo correto
+                manager.broadcast({"type": "kafka_event", "topic": message.topic, "data": data}),
                 loop
             )
-            logger.info(f"Kafka Worker Received: {data}")
     except Exception as e:
         logger.error(f"Kafka Worker FAILED: {e}")
 
@@ -1240,7 +1243,7 @@ async def startup_event():
         loop = asyncio.get_running_loop()
         thread = threading.Thread(
             target=kafka_worker,
-            args=(loop, KAFKA_SERVERS, KAFKA_TOPIC_PLAY),
+            args=(loop, KAFKA_SERVERS, KAFKA_CONSUMER_TOPICS),
             daemon=True
         )
         thread.start()

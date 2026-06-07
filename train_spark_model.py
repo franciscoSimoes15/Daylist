@@ -33,11 +33,13 @@ REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
 REDIS_RECS_TTL_SECONDS = int(os.getenv("REDIS_RECS_TTL_SECONDS", "86400"))
 
 
+    # Cria uma sessão Spark 
 def build_spark() -> SparkSession:
     return SparkSession.builder.appName("Music-Recommender-Training").enableHiveSupport().getOrCreate()
 
 
 def connect_redis() -> Any | None:
+    # Se a flag estiver desativada, não tenta ligar ao Redis.
     if not WRITE_REDIS_PRECOMPUTED:
         print("Redis precompute write disabled.")
         return None
@@ -64,6 +66,7 @@ def fetch_metadata_for_ids(spark: SparkSession, recording_ids: set[int]) -> dict
         return {}
     chunks = []
     ids = sorted(recording_ids)
+    # Divide os IDs em chunks de 1000 para evitar queries SQL demasiado longas
     for start in range(0, len(ids), 1000):
         ids_sql = ",".join(str(i) for i in ids[start:start + 1000])
         chunks.append(spark.sql(f"""
@@ -99,6 +102,7 @@ def precompute_and_write_recommendations(
     user_to_rids: dict[int, list[int]] = {}
     all_rids: set[int] = set()
 
+    # Gera recomendações para cada utilizador usando o modelo ALS treinado.
     for user_idx, user_id in user_dec.items():
         try:
             rec_indices, _ = model.recommend(user_idx, train_matrix[user_idx], N=PRECOMPUTE_TOP_N)
@@ -108,9 +112,14 @@ def precompute_and_write_recommendations(
         user_to_rids[int(user_id)] = rids
         all_rids.update(rids)
 
+    # Busca metadata (nome e artista) para todas as músicas recomendadas de uma vez,
+    # em vez de fazer uma query por música.
     metadata = fetch_metadata_for_ids(spark, all_rids)
     rows: list[dict[str, Any]] = []
     redis_client = connect_redis()
+
+    # Pipeline Redis para enviar todos os comandos de uma vez,
+    # reduz o número de round-trips à rede.
     pipe = redis_client.pipeline() if redis_client else None
 
     for user_id, rids in user_to_rids.items():
@@ -124,9 +133,12 @@ def precompute_and_write_recommendations(
         ]
         rows.append({"user_id": user_id, "songs_json": json.dumps(songs)})
         if pipe:
+            # TTL de 86400 segundos (24h) — as recomendações expiram e são regeneradas
+            # no próximo ciclo de treino, mantendo os dados "frescos".
             pipe.setex(f"recs:{user_id}", REDIS_RECS_TTL_SECONDS, json.dumps(songs))
 
-    # Also write a global fallback for cold-start users.
+    # Fallback global para utilizadores sem histórico (cold-start).
+    # Em vez de não recomendar nada, serve as músicas mais populares do sistema.
     popular_pdf = spark.sql(f"""
         SELECT CAST(r.id AS INT) AS id, CAST(r.name AS STRING) AS name, CAST(a.name AS STRING) AS artist, COUNT(*) AS score
         FROM {DATABASE}.curated_history h
@@ -166,9 +178,13 @@ def precision_recall_at_k(model, train_matrix, test_by_user: dict[int, set[int]]
             rec_indices, _ = model.recommend(user_idx, train_matrix[user_idx], N=k)
         except Exception:
             continue
+        # Converte índices internos de volta para recording_ids originais
+        # para poder comparar com truth_items que está em IDs originais.
         recommended = {rec_dec[int(i)] for i in rec_indices}
         hits = len(recommended & truth_items)
+        # Precision@K: dos K itens recomendados, que fração foi relevante?
         precisions.append(hits / k)
+        # Recall@K: dos itens relevantes conhecidos, que fração foi recomendada?
         recalls.append(hits / len(truth_items))
 
     if not precisions:
@@ -182,6 +198,10 @@ def main() -> None:
     spark.sparkContext.setLogLevel("ERROR")
 
     print(f"Fetch data from {DATABASE}.curated_history...")
+    # Agrega interações por par (user, recording) para obter:
+    # - plays: quantas vezes o utilizador ouviu a música
+    # - completion_rate: média da taxa de conclusão (ouviu até ao fim?)
+    # - avg_duration: duração média da música em milissegundos
     df_spark = spark.sql(f"""
         SELECT
             CAST(h.user_id AS INT) AS user_id,
@@ -203,6 +223,9 @@ def main() -> None:
         spark.stop()
         return
 
+    # Constrói um score implícito combinando três sinais de comportamento.
+    # Nota: avg_duration reflete o comprimento da faixa, não o engagement real
+    # do utilizador — pode introduzir ruído no score para músicas longas.
     training_data_spark = (
         df_spark.withColumn(
             "implicit_score",
@@ -218,7 +241,10 @@ def main() -> None:
     implicit_df = training_data_spark.toPandas()
 
     # -----------------------------
-    # FILTER LOW-SUPPORT ITEMS & LOW-ACTIVITY USERS
+    # FILTRAGEM ITERATIVA
+    # Filtragem única não é suficiente: remover itens raros pode tornar
+    # utilizadores insuficientemente ativos, e vice-versa. O ciclo repete
+    # até estabilizar, garantindo um core denso e coerente.
     # -----------------------------
     while True:
         prev = len(implicit_df)
@@ -261,6 +287,10 @@ def main() -> None:
     #train_df, test_df = train_test_split(implicit_df, test_size=0.2, random_state=RANDOM_STATE)
     # -----------------------------
     # LEAVE-ONE-OUT SPLIT PER USER
+    # Para cada utilizador com pelo menos 5 interações, reserva 1 item para teste.
+    # Utilizadores com menos de 5 interações vão inteiramente para treino —
+    # não há dados suficientes para os avaliar de forma justa.
+    # Limitação: a avaliação final só reflete utilizadores mais ativos.
     # -----------------------------
     train_rows = []
     test_rows = []
@@ -282,12 +312,15 @@ def main() -> None:
     user_list = train_df["user_id"].drop_duplicates().tolist()
     rec_list = train_df["recording_id"].drop_duplicates().tolist()
 
-    # IMPORTANT: include items from train + test to avoid leakage issues
+    # Inclui itens do teste na lista de itens conhecidos para que o modelo
+    # os possa recomendar durante a avaliação.
     rec_list = list(set(
         train_df["recording_id"].tolist() +
         test_df["recording_id"].tolist()
     ))
 
+    # Cria mapeamentos bidirecionais entre IDs originais e índices internos da matriz.
+    # O modelo ALS trabalha com índices inteiros contíguos.
     user_enc = {int(u): i for i, u in enumerate(user_list)}
     rec_enc = {int(r): i for i, r in enumerate(rec_list)}
     user_dec = {i: u for u, i in user_enc.items()}
@@ -297,18 +330,26 @@ def main() -> None:
     train_cols = train_df["recording_id"].map(rec_enc).astype(int)
     train_data = train_df["implicit_score"].astype(float).values
 
+    # Constrói a matriz esparsa no formato COO e converte para CSR.
+    # CSR é mais eficiente para operações aritméticas e slicing por linha,
+    # que é o que o ALS faz internamente durante o treino.
     train_matrix = coo_matrix(
         (train_data, (train_rows, train_cols)),
         shape=(len(user_list), len(rec_list)),
         dtype=np.float32,
     ).tocsr()
 
+    # BM25 normaliza utilizadores muito ativos que de outro modo dominariam
+    # os vetores aprendidos. K1=20 e B=0.3 são adequados
+    # para dados muito esparsos onde uma normalização agressiva perderia valor.
     train_matrix = bm25_weight(train_matrix, K1=20, B=0.3).tocsr()
 
     test_rows = test_df["user_id"].map(user_enc).astype(int).values
     test_cols = test_df["recording_id"].map(rec_enc).astype(int).values
     test_real = test_df["implicit_score"].astype(float).values
 
+    # Constrói dicionário de ground truth: user_idx -> conjunto de recording_ids reais.
+    # Usa IDs originais (não codificados) para compatibilidade com a função de avaliação.
     test_by_user: dict[int, set[int]] = defaultdict(set)
     for _, row in test_df.iterrows():
         test_by_user[user_enc[int(row["user_id"])]].add(int(row["recording_id"]))
@@ -323,6 +364,9 @@ def main() -> None:
         mlflow.log_param("interactions", int(len(implicit_df)))
 
         print("Train ALS model...")
+        # ALS para feedback implícito: em vez de ratings explícitos, usa contagens
+        # de interações como proxy de preferência. O parâmetro alpha controla
+        # a confiança nas observações — alpha=40 dá peso elevado a interações repetidas.
         model = implicit.als.AlternatingLeastSquares(
             factors=128,
             iterations=50,
@@ -332,13 +376,12 @@ def main() -> None:
         )
         model.fit(train_matrix)
 
-        # LightFM handles cold-start + sparse better
-        #from lightfm import LightFM
-        #model = LightFM(no_components=64, loss='warp')
-
         print("Evaluate model...")
         print("Compute popularity baseline...")
 
+
+        # Baseline de popularidade: recomenda as músicas mais ouvidas globalmente.
+        # Um modelo útil deve superar esta baseline, se não superar, não aprendeu nada.
         popular = (
             implicit_df.groupby("recording_id")
             .size()
@@ -361,6 +404,8 @@ def main() -> None:
 
         guesses = np.sum(model.user_factors[test_rows] * model.item_factors[test_cols], axis=1)
         #rmse = math.sqrt(float(np.mean((test_real - guesses) ** 2)))
+
+        # Calcula precision e recall@K para o modelo ALS.
         precision_k, recall_k = precision_recall_at_k(model, train_matrix, test_by_user, rec_dec, TOP_K)
 
         #mlflow.log_metric("rmse", rmse)
@@ -372,6 +417,8 @@ def main() -> None:
         print(f"Recall@{TOP_K} = {recall_k:.4f}")
 
         print(f"Save model to {model_path}...")
+
+        # Serializa o modelo e todos os mapeamentos necessários para inferência.
         with open(model_path, "wb") as f:
             pickle.dump(
                 {
